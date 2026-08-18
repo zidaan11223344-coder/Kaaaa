@@ -100,18 +100,104 @@ YOUTUBE_COOKIES_PATH = str(C.get("youtube_cookies_path", "youtube_cookies.txt"))
 YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
 TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
 SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
-if YOUTUBE_COOKIES_ENV:
+
+
+def _normalize_cookie_text(raw):
+    """تنظيف محتوى ملف cookies القادم من متغيرات Railway.
+
+    الأخطاء الشائعة: أسطر مكتوبة كـ \n نصية، مسافات بدل TAB، أو غياب ترويسة
+    Netscape. yt-dlp يرفض الملف في كل هذه الحالات ويظهر الخطأ كأنه فشل يوتيوب.
+    """
+    text = str(raw or "")
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    text = text.replace("\\t", "\t").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if not line:
+            continue
+        if line.lstrip().startswith("#"):
+            lines.append(line)
+            continue
+        if "\t" not in line:
+            parts = re.split(r"\s{1,}", line.strip())
+            if len(parts) >= 7:
+                line = "\t".join(parts[:6] + [" ".join(parts[6:])])
+        lines.append(line)
+    if not lines:
+        return ""
+    if not lines[0].startswith("# Netscape HTTP Cookie File"):
+        lines.insert(0, "# Netscape HTTP Cookie File")
+    return "\n".join(lines) + "\n"
+
+
+def _write_cookie_file(raw, path):
+    """كتابة ملف cookies صالح وإرجاع مساره، أو None إذا لم يكن صالحاً."""
+    content = _normalize_cookie_text(raw)
+    data_lines = [l for l in content.split("\n") if l and not l.startswith("#")]
+    if not data_lines:
+        return None
     try:
-        Path("/tmp/youtube_cookies.txt").write_text(YOUTUBE_COOKIES_ENV, encoding="utf-8")
-        YOUTUBE_COOKIES_PATH = "/tmp/youtube_cookies.txt"
+        p = Path(path)
+        p.write_text(content, encoding="utf-8")
+        return str(p)
     except Exception as _e:
-        log.warning("تعذر إنشاء YouTube cookies: %s", _e)
+        log.warning("تعذر إنشاء ملف cookies %s: %s", path, _e)
+        return None
+
+
+if YOUTUBE_COOKIES_ENV:
+    _yt_cookie_file = _write_cookie_file(YOUTUBE_COOKIES_ENV, "/tmp/youtube_cookies.txt")
+    if _yt_cookie_file:
+        YOUTUBE_COOKIES_PATH = _yt_cookie_file
+    else:
+        log.warning("YOUTUBE_COOKIES موجود لكنه غير صالح بصيغة Netscape؛ تم تجاهله.")
+elif YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
+    _fixed = _write_cookie_file(Path(YOUTUBE_COOKIES_PATH).read_text(encoding="utf-8", errors="ignore"),
+                                "/tmp/youtube_cookies.txt")
+    if _fixed:
+        YOUTUBE_COOKIES_PATH = _fixed
+
 TIKTOK_COOKIES_PATH = "/tmp/tiktok_cookies.txt"
 if TIKTOK_COOKIES_ENV:
-    try:
-        Path(TIKTOK_COOKIES_PATH).write_text(TIKTOK_COOKIES_ENV, encoding="utf-8")
-    except Exception as _e:
-        log.warning("تعذر إنشاء TikTok cookies: %s", _e)
+    if not _write_cookie_file(TIKTOK_COOKIES_ENV, TIKTOK_COOKIES_PATH):
+        log.warning("TIKTOK_COOKIES غير صالح؛ سيعمل TikTok بدون cookies.")
+
+
+def has_youtube_cookies():
+    return bool(YOUTUBE_COOKIES_PATH) and os.path.isfile(YOUTUBE_COOKIES_PATH)
+
+
+def yt_base_options(source_label="YouTube"):
+    """خيارات yt-dlp موحّدة لكل مصادر الصوت.
+
+    مهم: عند استخدام cookies يجب عدم استخدام عميل android/ios لأن يوتيوب
+    يتجاهل الجلسة معهما ويعيد «Sign in to confirm you're not a bot».
+    """
+    options = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "socket_timeout": 35, "retries": 5, "fragment_retries": 5,
+        "extractor_retries": 4, "file_access_retries": 3,
+        "cachedir": False, "geo_bypass": True, "overwrites": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        },
+    }
+    if source_label == "YouTube":
+        if has_youtube_cookies():
+            options["cookiefile"] = YOUTUBE_COOKIES_PATH
+            options["extractor_args"] = {"youtube": {"player_client": ["web", "mweb", "tv"]}}
+        else:
+            options["extractor_args"] = {
+                "youtube": {"player_client": ["tv", "ios", "web_safari", "web"]}
+            }
+    elif source_label == "TikTok" and os.path.isfile(TIKTOK_COOKIES_PATH):
+        options["cookiefile"] = TIKTOK_COOKIES_PATH
+    return options
+
+
 PIPED_APIS = [x.strip().rstrip("/") for x in C.get("piped_apis", [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
@@ -221,7 +307,14 @@ GAME_IMAGES = {
     "dice": TWEMOJI + "1f3b2.png",
     "marriage": TWEMOJI + "1f48d.png",
     "challenge": TWEMOJI + "1f4aa.png",
-    "mine": TWEMOJI + "26cf.png"
+    "mine": TWEMOJI + "26cf.png",
+    # ألعاب جديدة بصور PNG مولّدة داخل مجلد assets
+    "sniper": game_asset("game_sniper.png"),
+    "fishing": game_asset("game_fishing.png"),
+    "treasure": game_asset("game_treasure.png"),
+    "sword": game_asset("game_sword.png"),
+    "guess": game_asset("game_treasure.png"),
+    "quiz": game_asset("game_sword.png")
 }
 
 # ----------------------------- أدوات البيانات -----------------------------
@@ -716,15 +809,8 @@ async def _yt_extract(search_query):
         return None
 
     def extract():
-        options = {
-            "quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True, "default_search": "ytsearch1",
-            "socket_timeout": 25, "retries": 3, "extractor_retries": 3,
-            "cachedir": False, "geo_bypass": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        }
-        if YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
-            options["cookiefile"] = YOUTUBE_COOKIES_PATH
+        options = yt_base_options("YouTube")
+        options.update({"skip_download": True, "default_search": "ytsearch1"})
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(f"ytsearch1:{q}", download=False)
             entry = (info.get("entries") or [None])[0] if info else info
@@ -784,22 +870,11 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             return None, "مكتبة yt-dlp غير مثبتة، ولم يتوفر مصدر Piped."
 
         def download_with_format(fmt, suffix="audio"):
-            options = {
-                "quiet": True, "no_warnings": True, "noplaylist": True,
+            options = yt_base_options(source_label)
+            options.update({
                 "format": fmt,
                 "outtmpl": str(temp_dir / f"{suffix}.%(ext)s"),
-                "socket_timeout": 35, "retries": 5, "fragment_retries": 5,
-                "extractor_retries": 4, "file_access_retries": 3,
-                "cachedir": False, "geo_bypass": True, "overwrites": True,
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
-                },
-                "extractor_args": {
-                    "youtube": {"player_client": ["android", "web"]}
-                },
-            }
-            if YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
-                options["cookiefile"] = YOUTUBE_COOKIES_PATH
+            })
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([page_url])
 
@@ -952,7 +1027,16 @@ async def start_media_server():
         path = media_dir / name
         if not path.is_file():
             raise web.HTTPNotFound()
-        return web.FileResponse(path)
+        ctype = {
+            ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+            ".webm": "audio/webm", ".ogg": "audio/ogg", ".wav": "audio/wav",
+        }.get(path.suffix.lower(), "application/octet-stream")
+        return web.FileResponse(path, headers={
+            "Content-Type": ctype,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "Access-Control-Allow-Origin": "*",
+        })
 
     app.router.add_get(f"{MEDIA_PATH}/{{name}}", media_handler)
 
@@ -973,6 +1057,11 @@ async def start_media_server():
             raise web.HTTPNotFound()
         return web.FileResponse(file_path)
 
+    async def health_handler(request):
+        return web.json_response({"ok": True, "media": MEDIA_PATH})
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
     app.router.add_get("/assets/{path:.*}", public_asset_handler)
     app.router.add_get("/gifts/{name}", gift_handler)
     runner = web.AppRunner(app, access_log=None)
@@ -1144,17 +1233,8 @@ async def _extract_direct_media_url(url, source_label):
         return None, "مكتبة yt-dlp غير مثبتة."
 
     def extract():
-        options = {
-            "quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True, "socket_timeout": 30, "retries": 4,
-            "extractor_retries": 4, "cachedir": False,
-            "format": "bestaudio/best",
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
-        }
-        if source_label == "YouTube" and YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
-            options["cookiefile"] = YOUTUBE_COOKIES_PATH
-        if source_label == "TikTok" and os.path.isfile(TIKTOK_COOKIES_PATH):
-            options["cookiefile"] = TIKTOK_COOKIES_PATH
+        options = yt_base_options(source_label)
+        options.update({"skip_download": True, "format": "bestaudio/best"})
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(u, download=False)
         if not info:
@@ -1241,13 +1321,8 @@ async def search_tiktok(query):
             return None, "لم أجد فيديو TikTok. إذا كان لديك رابط TikTok أرسله بعد «تيك»."
 
         def extract():
-            options = {
-                "quiet": True, "no_warnings": True, "skip_download": True,
-                "noplaylist": True, "format": "bestaudio/best", "socket_timeout": 25,
-                "retries": 3, "extractor_retries": 3, "cachedir": False,
-            }
-            if os.path.isfile(TIKTOK_COOKIES_PATH):
-                options["cookiefile"] = TIKTOK_COOKIES_PATH
+            options = yt_base_options("TikTok")
+            options.update({"skip_download": True, "format": "bestaudio/best"})
             info = None
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(urls[0], download=False)
@@ -1265,7 +1340,12 @@ async def search_tiktok(query):
         return None, "تعذر الوصول إلى TikTok من الخادم. إذا كان الخادم PythonAnywhere المجاني فلن تعمل هذه الميزة بسبب قيود الإنترنت الخارجية."
 
 
-async def play_track(rid, track, source_label):
+def music_caption(requester_name):
+    """رسالة مختصرة: اسم من طلب الأغنية فقط + أزرار الإعجاب وإعادة النشر."""
+    return f"🎵 @{requester_name}\n❤️ إعجاب | 🔁 إعادة نشر"
+
+
+async def play_track(rid, track, source_label, requester_name=None):
     if not track:
         return False, "لم أجد المقطع المطلوب"
 
@@ -1273,49 +1353,63 @@ async def play_track(rid, track, source_label):
     if err:
         return False, err
 
-    track.update({"requester_id": BOT_ID, "requester_name": USERNAME})
+    requester_name = requester_name or USERNAME
+    track.update({"requester_id": BOT_ID, "requester_name": requester_name})
     music_state[rid] = track
     title = track.get("title", "المقطع")
-    artist = track.get("artist", source_label)
+    caption = music_caption(requester_name)
     media_url = track.get("audio_url")
     if not media_url:
         # لا نُخفي الرابط إذا فشل التنزيل: إرسال الرابط المباشر يسمح للعميل
         # بفتحه/تشغيله إذا كان Giant Chat يدعم تشغيل روابط الوسائط.
         direct_url = track.get("youtube_url") or track.get("spotify_url") or track.get("tiktok_url")
         if direct_url:
-            title = track.get("title", "المقطع")
-            artist = track.get("artist", source_label)
-            await room_send(
-                rid,
-                f"🔗 تعذر تنزيل الصوت من الخادم، لكن هذا رابط التشغيل المباشر:\n"
-                f"🎵 {title} — {artist}\n"
-                f"▶️ تشغيل الرابط: {direct_url}"
+            for room_id in await all_room_ids():
+                try:
+                    await room_send(room_id, f"{caption}\n▶️ {direct_url}")
+                except Exception:
+                    log.exception("music link broadcast failed for room %s", room_id)
+            await report_music_error_to_masters(
+                rid, source_label, title,
+                "تعذر تنزيل ملف الصوت، تم إرسال الرابط المباشر بدل البصمة الصوتية.",
+                stage="بديل الرابط",
             )
             return True, None
         return False, "تعذر تجهيز ملف الصوت ولا يوجد رابط تشغيل مباشر"
 
-    if track.get("thumbnail"):
-        await room_send_media(rid, f"🖼️ {title}", track["thumbnail"], m_type="image")
-
+    # لا تُرسل صورة الأغنية إطلاقاً — الرسالة مختصرة باسم الطالب فقط.
     duration_ms = int(float(track.get("duration") or 0) * 1000)
-    await room_send(rid, f"🎵 تشغيل من {source_label}\n🎶 {title} — {artist}")
     log.info("إرسال صوت Giant Chat: room=%s type=voice format=%s url=%s",
              rid, track.get("media_format", ""), media_url)
-    await room_send_media(
-        rid,
-        f"▶️ تشغيل الصوت\n🎵 {title} — {artist}",
-        media_url,
-        m_type="voice",
-        duration_ms=duration_ms,
-    )
+
+    sent = 0
+    for room_id in await all_room_ids():
+        try:
+            music_state[room_id] = track
+            await room_send_media(
+                room_id,
+                caption,
+                media_url,
+                m_type="voice",
+                duration_ms=duration_ms,
+            )
+            sent += 1
+        except Exception:
+            log.exception("music broadcast failed for room %s", room_id)
+
+    if not sent:
+        return False, "تعذر إرسال الصوت إلى أي غرفة"
     return True, None
+
 
 
 async def music_worker_queue():
     global last_music_started
     interval = max(0, int(C.get("music_interval_seconds", 0)))
     while True:
-        rid, query, source = await music_queue.get()
+        item = await music_queue.get()
+        rid, query, source = item[0], item[1], item[2]
+        requester_name = item[3] if len(item) > 3 else USERNAME
         try:
             wait = interval - (time.time() - last_music_started)
             if wait > 0:
@@ -1331,14 +1425,22 @@ async def music_worker_queue():
             else:
                 track, err = await search_track(query)
 
+            used_source = source
+            if err and source in ("YouTube", "Spotify"):
+                # مصدر احتياطي: إذا فشل يوتيوب/سبوتيفاي نجرب TikTok الذي يعمل على Railway.
+                await report_music_error_to_masters(rid, source, query, err, stage="البحث")
+                alt_track, alt_err = await search_tiktok(query)
+                if alt_track and not alt_err:
+                    track, err, used_source = alt_track, None, "TikTok"
+
             if err:
-                await room_send(rid, f"❌ {err}")
+                await room_send(rid, "❌ لم أتمكن من تشغيل هذه الأغنية الآن، جرّب اسماً آخر.")
                 await report_music_error_to_masters(rid, source, query, err, stage="البحث")
             else:
-                ok, out = await play_track(rid, track, source)
+                ok, out = await play_track(rid, track, used_source, requester_name)
                 if not ok and out:
-                    await room_send(rid, f"❌ {out}")
-                    await report_music_error_to_masters(rid, source, query, out, stage="التنزيل/التجهيز/الإرسال")
+                    await room_send(rid, "❌ تعذر تجهيز الصوت، حاول مرة أخرى.")
+                    await report_music_error_to_masters(rid, used_source, query, out, stage="التنزيل/التجهيز/الإرسال")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1391,6 +1493,12 @@ HELP_GAMES = """━━━━━━━━ 🎮 أوامر الألعاب ━━�
 👻 شبح — صيد الشبح
 🎲 مضاربة رقم — مراهنة
 🎲 حظ / نرد / تعدين / زواج
+🎯 قنص — قنص الهدف
+🎣 صيد — صيد السمك
+🗺️ كنز — البحث عن الكنز
+⚔️ سيف — مبارزة سيوف
+🔢 تخمين رقم — خمن رقماً من 1 إلى 10
+🧠 ذكاء — سؤال سريع، ثم: ذكاء الإجابة
 ━━━━━━━━━━━━━━━━━━━━
 كل لعبة ترسل صورة اللعبة مع النتيجة والنقاط.
 """
@@ -1410,6 +1518,7 @@ st@الاسم — حالة المستخدم
 مشاركة — مشاركة الأغنية الحالية
 تخطي — تخطي الأغنية
 ايقاف — إيقاف الصوت
+📢 تُنشر الأغنية في جميع الغرف باسم من طلبها مع ❤️ إعجاب | 🔁 إعادة نشر
 
 [3] الألعاب
 العاب — عرض أوامر الألعاب
@@ -1652,7 +1761,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
 
     GAME_COMMANDS = {"عمل","job","كف","slap","مضاربة","bet","حرب","war","سرقة","rob","قتال","fight",
-                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين"}
+                     "سباق","race","رشوة","سلة","قصف","اضرب","ورق","سدد","ملاكمة","بركان","شبح","حظ","نرد","تعدين",
+                     "قنص","صيد","كنز","سيف","تخمين","guess","ذكاء","quiz"}
 
     async def require_game_cooldown():
         ok_cd, rem_cd = await game_cooldown()
@@ -1663,7 +1773,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in ("تشغيل", "play", "شغل"):
 
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
-        await music_queue.put((rid, arg, "YouTube"))
+        await music_queue.put((rid, arg, "YouTube", p_name))
         return "🎵 جاري تجهيز الأغنية من المصدر المتاح..."
 
     if cmd in ("مشاركة", "share"):
@@ -1675,19 +1785,12 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
         if not arg:
             return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
-        track, err = await search_spotify(arg)
-        if err:
-            await report_music_error_to_masters(rid, "Spotify", arg, err, stage="البحث")
-            return f"❌ {err}"
-        ok, out = await play_track(rid, track, "Spotify")
-        if not ok and out:
-            await report_music_error_to_masters(rid, "Spotify", arg, out, stage="التنزيل/التجهيز/الإرسال")
-            return f"❌ {out}"
-        return None
+        await music_queue.put((rid, arg, "Spotify", p_name))
+        return "🎵 جاري تجهيز الأغنية من Spotify..."
 
     if cmd in ("تيك", ".تيك", "tiktok", "tik"):
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
-        await music_queue.put((rid, arg, "TikTok"))
+        await music_queue.put((rid, arg, "TikTok", p_name))
         return "🎵 جاري تجهيز صوت TikTok..."
 
     # لعبة الحرب: لاعبان، سفينة في 1..6، 3 محاولات لكل لاعب، مع انتهاء تلقائي.
@@ -1928,7 +2031,11 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         "بركان": ("volcano", 0, -20, 0, "", "🌋 ثوران بركاني!"),
         "شبح": ("ghost", 50, 0, 50, "👻 أمسكت بالشبح!", "👻 أخافك الشبح.."),
         "حظ": ("luck", 50, -30, 50, "🎲 حظ سعيد!", "📉 حظ سيء.."),
-        "نرد": ("dice", 15, -10, 50, "🎲 فوز بالنرد!", "🎲 خسارة بالنرد..")
+        "نرد": ("dice", 15, -10, 50, "🎲 فوز بالنرد!", "🎲 خسارة بالنرد.."),
+        "قنص": ("sniper", 45, -15, 45, "🎯 طلقة في المنتصف!", "🎯 أخطأت الهدف.."),
+        "صيد": ("fishing", 35, -5, 55, "🎣 اصطدت سمكة كبيرة!", "🎣 هرب الصيد.."),
+        "كنز": ("treasure", 80, -25, 35, "🏆 عثرت على الكنز!", "🗺️ الخريطة كانت مزيفة.."),
+        "سيف": ("sword", 40, -20, 50, "⚔️ ضربة سيف قاتلة!", "⚔️ كُسر سيفك..")
     }
     
     if cmd in games_map:
@@ -1939,6 +2046,58 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         win = random.randint(1, 100) <= chance
         add_points(uid, p_name, win_p if win else lose_p)
         await room_send_media(rid, f"{win_m if win else lose_m} @{p_name}\n💰 النتيجة: {win_p if win else lose_p} ن.", GAME_IMAGES[key])
+        return None
+
+    # 🎯 لعبة تخمين رقم من 1 إلى 10
+    if cmd in ("تخمين", "guess"):
+        cd_error = await require_game_cooldown()
+        if cd_error:
+            return cd_error
+        try:
+            n = int(arg)
+        except Exception:
+            return "❌ اكتب: تخمين رقم من 1 إلى 10"
+        if not 1 <= n <= 10:
+            return "❌ الرقم يجب أن يكون بين 1 و 10."
+        secret = random.randint(1, 10)
+        win = (n == secret)
+        add_points(uid, p_name, 90 if win else -10)
+        await room_send_media(
+            rid,
+            f"{'🎉 تخمين صحيح!' if win else '❌ تخمين خاطئ..'} @{p_name}\n🔢 الرقم كان {secret}\n💰 النتيجة: {'+90' if win else '-10'} ن.",
+            GAME_IMAGES["guess"],
+        )
+        return None
+
+    # 🧠 لعبة سؤال سريع (حساب)
+    if cmd in ("ذكاء", "quiz"):
+        key = f"quiz_{rid}"
+        game = kaf_games.get(key)
+        if game and time.time() - game.get("at", 0) > 60:
+            kaf_games.pop(key, None)
+            game = None
+        if not game:
+            cd_error = await require_game_cooldown()
+            if cd_error:
+                return cd_error
+            a, b = random.randint(2, 12), random.randint(2, 12)
+            kaf_games[key] = {"answer": a * b, "at": time.time()}
+            await room_send_media(
+                rid,
+                f"🧠 سؤال سريع: كم يساوي {a} × {b}؟\n⌛ لديك دقيقة — اكتب: ذكاء الإجابة\n🏅 الجائزة 70 نقطة.",
+                GAME_IMAGES["quiz"],
+            )
+            return None
+        try:
+            ans = int(arg)
+        except Exception:
+            return "❌ اكتب: ذكاء ثم الإجابة."
+        if ans == game["answer"]:
+            kaf_games.pop(key, None)
+            add_points(uid, p_name, 70)
+            await room_send_media(rid, f"🧠 إجابة صحيحة! @{p_name}\n💰 +70 نقطة.", GAME_IMAGES["quiz"])
+        else:
+            return "❌ إجابة خاطئة، حاول مرة أخرى."
         return None
 
     if cmd == "تعدين":
