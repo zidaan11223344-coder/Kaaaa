@@ -251,7 +251,7 @@ def load_welcome(): return load_json(WELCOME_PATH, {})
 def save_welcome(x): save_json(WELCOME_PATH, x)
 
 def normalize_text(s):
-    return re.sub(r"\\s+", " ", str(s or "").strip().lower())
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
 
 async def check_forbidden_word(rid, text):
     mod = load_moderation()
@@ -465,7 +465,7 @@ def publish_gift_image(local_path):
         or PUBLIC_BASE_URL
     ).rstrip("/")
     if not base_url:
-        raise RuntimeError("لم يتم ضبط PUBLIC_BASE_URL أو gift_public_base_url")
+        raise RuntimeError("لم يتم العثور على رابط عام. اضبط PUBLIC_BASE_URL أو استخدم RAILWAY_PUBLIC_DOMAIN.")
 
     path = Path(local_path).resolve()
     render_dir = GIFT_RENDER_DIR.resolve()
@@ -622,15 +622,70 @@ async def dm_send(uid, text):
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
     }).execute())
 
+async def _master_user_ids():
+    """Resolve saved master usernames/IDs to profile IDs for private diagnostics."""
+    result = set()
+    for master in load_masters():
+        value = str(master).strip()
+        if not value:
+            continue
+        # Masters may already be stored as UUID/user IDs.
+        result.add(value)
+        try:
+            rows, _ = await table_select(
+                lambda v=value: sb.table("profiles").select("id").ilike("username", v).limit(5).execute()
+            )
+            for row in rows or []:
+                if row.get("id"):
+                    result.add(str(row["id"]))
+        except Exception:
+            log.exception("failed to resolve master %s", value)
+    # The owner is always a diagnostic recipient.
+    try:
+        rows, _ = await table_select(
+            lambda: sb.table("profiles").select("id").ilike("username", OWNER).limit(5).execute()
+        )
+        for row in rows or []:
+            if row.get("id"):
+                result.add(str(row["id"]))
+    except Exception:
+        pass
+    return result
+
+async def report_music_error_to_masters(rid, source, query, error, stage="تشغيل"):
+    """Send the real music failure privately to every master/owner.
+    Secrets such as cookie values are never included.
+    """
+    raw = str(error or "خطأ غير معروف").replace("\x1b", "")
+    raw = re.sub(r"\[[0-9;]*m", "", raw)
+    raw = raw.strip()
+    if len(raw) > 1800:
+        raw = raw[:1800] + "…"
+    room_name = rooms.get(rid, str(rid))
+    msg = (
+        "🛠️ تشخيص فشل تشغيل الأغنية\n"
+        f"📍 المرحلة: {stage}\n"
+        f"🎵 المصدر: {source}\n"
+        f"🔎 الطلب: {query}\n"
+        f"🏠 الغرفة: {room_name}\n"
+        f"🕒 الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"❌ الخطأ الحقيقي:\n{raw}"
+    )
+    for master_id in await _master_user_ids():
+        try:
+            await dm_send(master_id, msg)
+        except Exception:
+            log.exception("failed to send music diagnostic to master %s", master_id)
+
 # ----------------------------- الموسيقى -----------------------------
 async def _yt_extract(search_query):
-    """Search YouTube. Prefer Piped so the bot does not depend on YouTube's
-    anti-bot challenge; fall back to yt-dlp when Piped is unavailable."""
+    """Search YouTube metadata without requiring a playable format.
+    Playback/download is handled separately with several format fallbacks."""
     q = str(search_query).strip()
     if q.lower().startswith("ytsearch1:"):
         q = q.split(":", 1)[1].strip()
 
-    # Piped: no YouTube cookies required and returns a public audio stream.
     for api in PIPED_APIS:
         try:
             async with http.get(
@@ -663,10 +718,10 @@ async def _yt_extract(search_query):
     def extract():
         options = {
             "quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True, "format": "bestaudio/best", "default_search": "ytsearch1",
-            "socket_timeout": 20, "retries": 2, "fragment_retries": 2,
-            "extractor_retries": 2, "file_access_retries": 2, "cachedir": False,
-            "geo_bypass": True,
+            "noplaylist": True, "default_search": "ytsearch1",
+            "socket_timeout": 25, "retries": 3, "extractor_retries": 3,
+            "cachedir": False, "geo_bypass": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         }
         if YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
             options["cookiefile"] = YOUTUBE_COOKIES_PATH
@@ -681,15 +736,16 @@ async def _yt_extract(search_query):
                 "youtube_url": entry.get("webpage_url") or entry.get("original_url"),
                 "thumbnail": entry.get("thumbnail"), "duration": entry.get("duration") or 0,
             }
-    return await asyncio.to_thread(extract)
-
-
+    try:
+        return await asyncio.to_thread(extract)
+    except Exception as e:
+        log.warning("yt-dlp metadata search failed: %s", e)
+        return None
 async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=None):
-    """Download audio to a temporary file. Piped is preferred because it
-    avoids YouTube's sign-in/robot challenge. yt-dlp is the final fallback."""
+    """Download audio using Piped first, then multiple yt-dlp fallbacks.
+    This avoids failing when YouTube removes a particular requested format."""
     temp_dir = Path(tempfile.mkdtemp(prefix="bot_audio_"))
     try:
-        # Prefer the Piped stream endpoint.
         if piped_api and video_id:
             try:
                 async with http.get(
@@ -700,45 +756,85 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
                     if resp.status == 200:
                         info = await resp.json(content_type=None)
                         streams = info.get("audioStreams") or []
-                        streams = sorted(streams, key=lambda x: float(x.get("bitrate") or 0), reverse=True)
-                        if streams and streams[0].get("url"):
-                            ext = ".m4a" if "mp4" in str(streams[0].get("mimeType", "")) else ".webm"
-                            out = temp_dir / f"audio{ext}"
-                            async with http.get(streams[0]["url"], timeout=aiohttp.ClientTimeout(total=120)) as ar:
-                                if ar.status == 200:
-                                    with out.open("wb") as f:
-                                        async for chunk in ar.content.iter_chunked(1024 * 256):
-                                            f.write(chunk)
-                                    if out.stat().st_size > 4096:
-                                        return out, None
+                        streams = sorted(
+                            streams,
+                            key=lambda x: float(x.get("bitrate") or 0),
+                            reverse=True,
+                        )
+                        for stream in streams:
+                            url = stream.get("url")
+                            if not url:
+                                continue
+                            try:
+                                ext = ".m4a" if "mp4" in str(stream.get("mimeType", "")) else ".webm"
+                                out = temp_dir / f"audio{ext}"
+                                async with http.get(url, timeout=aiohttp.ClientTimeout(total=120)) as ar:
+                                    if ar.status == 200:
+                                        with out.open("wb") as f:
+                                            async for chunk in ar.content.iter_chunked(1024 * 256):
+                                                f.write(chunk)
+                                        if out.stat().st_size > 4096:
+                                            return out, None
+                            except Exception:
+                                continue
             except Exception as e:
                 log.warning("Piped audio download failed: %s", e)
 
         if yt_dlp is None:
             return None, "مكتبة yt-dlp غير مثبتة، ولم يتوفر مصدر Piped."
 
-        def download():
+        def download_with_format(fmt, suffix="audio"):
             options = {
                 "quiet": True, "no_warnings": True, "noplaylist": True,
-                "format": "bestaudio/best", "outtmpl": str(temp_dir / "audio.%(ext)s"),
-                "socket_timeout": 30, "retries": 3, "fragment_retries": 3,
-                "extractor_retries": 3, "file_access_retries": 2,
+                "format": fmt,
+                "outtmpl": str(temp_dir / f"{suffix}.%(ext)s"),
+                "socket_timeout": 35, "retries": 5, "fragment_retries": 5,
+                "extractor_retries": 4, "file_access_retries": 3,
                 "cachedir": False, "geo_bypass": True, "overwrites": True,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                },
+                "extractor_args": {
+                    "youtube": {"player_client": ["android", "web"]}
+                },
             }
             if YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
                 options["cookiefile"] = YOUTUBE_COOKIES_PATH
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([page_url])
-        await asyncio.to_thread(download)
-        files = [p for p in temp_dir.iterdir() if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
-        if not files:
-            return None, f"تعذر تنزيل صوت {source_label}."
-        return files[0], None
+
+        # Try several selectors because available formats vary by video/client.
+        formats = [
+            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "bestaudio/best",
+            "best[ext=mp4]/best",
+        ]
+        last_error = None
+        for idx, fmt in enumerate(formats):
+            try:
+                for p in temp_dir.glob("*"):
+                    if p.is_file() and p.suffix not in (".part", ".ytdl"):
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}")
+                files = [
+                    p for p in temp_dir.iterdir()
+                    if p.is_file() and p.suffix not in (".part", ".ytdl") and p.stat().st_size > 4096
+                ]
+                if files:
+                    return max(files, key=lambda p: p.stat().st_size), None
+            except Exception as e:
+                last_error = e
+                log.warning("yt-dlp audio format failed (%s): %s", fmt, e)
+
+        if last_error:
+            log.warning("All audio download formats failed: %s", last_error)
+        return None, f"{type(last_error).__name__}: {last_error}" if last_error else f"تعذر تنزيل الصوت من {source_label}: سبب غير معروف"
     except Exception as e:
         log.warning("%s audio download failed: %s", source_label, e)
-        return None, f"تعذر تنزيل الصوت من {source_label}. جرّب أغنية أخرى."
-
-
+        return None, f"{type(e).__name__}: {e}"
 async def _upload_bytes_storage(local_path, bucket, prefix, content_type):
     """رفع ملف إلى Supabase Storage وإرجاع رابط ثابت/عام."""
     if not bucket:
@@ -777,8 +873,11 @@ async def prepare_game_assets():
             GAME_IMAGES[key] = public_url
         except Exception as e:
             log.warning("تعذر رفع صورة اللعبة %s: %s", key, e)
-            if GAME_BASE_URL:
-                GAME_IMAGES[key] = f"{GAME_BASE_URL}/{quote(local.name)}"
+            if GAME_BASE_URL or PUBLIC_BASE_URL:
+                GAME_IMAGES[key] = f"{GAME_BASE_URL or PUBLIC_BASE_URL}/assets/{quote(local.name)}"
+        if (not str(GAME_IMAGES.get(key, "")).startswith(("http://", "https://"))
+                and (GAME_BASE_URL or PUBLIC_BASE_URL)):
+            GAME_IMAGES[key] = f"{GAME_BASE_URL or PUBLIC_BASE_URL}/assets/{quote(local.name)}"
 
 async def _store_media(local_path, kind="music", content_type=None):
     """تجهيز رابط عام ثابت للوسائط.
@@ -806,7 +905,7 @@ async def _store_media(local_path, kind="music", content_type=None):
         storage_mode = PUBLISH_STORAGE
         bucket = PUBLISH_BUCKET
         local_dir = PUBLISH_LOCAL_DIR
-        base_url = PUBLISH_PUBLIC_BASE_URL
+        base_url = PUBLIC_BASE_URL or PUBLISH_PUBLIC_BASE_URL
 
     # Railway/local public server: لا يحتاج bucket عام ولا سياسة Storage.
     if kind == "music" and base_url and storage_mode in ("railway", "local", "auto", "supabase"):
@@ -960,6 +1059,64 @@ async def _prepare_music_track(track, source_label):
             pass
 
 
+async def search_spotify(query):
+    """Resolve a Spotify track to metadata, then use a public YouTube copy for
+    the actual audio bytes. Spotify itself does not expose downloadable audio."""
+    q = str(query or "").strip()
+    if not q:
+        return None, "اكتب اسم الأغنية بعد .تشغيل"
+
+    spotify_url = None
+    if re.match(r"https?://open\.spotify\.com/(?:intl-[^/]+/)?track/[A-Za-z0-9]+", q):
+        spotify_url = q
+    else:
+        # Discover a public Spotify track URL through search engines.
+        headers = {"User-Agent": "Mozilla/5.0"}
+        for engine, params in (
+            ("https://www.google.com/search", {"q": f'site:open.spotify.com/track "{q}"'}),
+            ("https://www.bing.com/search", {"q": f'site:open.spotify.com/track "{q}"'}),
+        ):
+            try:
+                async with http.get(engine, params=params, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text(errors="ignore")
+                urls = re.findall(r'https?://open\.spotify\.com/(?:intl-[^/]+/)?track/[A-Za-z0-9]+', html)
+                if urls:
+                    spotify_url = urls[0].split("&")[0]
+                    break
+            except Exception as e:
+                log.warning("Spotify discovery failed: %s", e)
+
+    title = q
+    artist = "Spotify"
+    if spotify_url:
+        try:
+            async with http.get(
+                "https://open.spotify.com/oembed",
+                params={"url": spotify_url},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    title = data.get("title") or title
+                    artist = data.get("author_name") or artist
+        except Exception as e:
+            log.warning("Spotify oEmbed failed: %s", e)
+
+    # Search the same title on YouTube for the actual playable audio.
+    track = await _yt_extract(f"{title} {artist}")
+    if not track:
+        return None, "تعذر العثور على نسخة صوتية للمقطع من Spotify."
+    track["spotify_url"] = spotify_url
+    track["spotify_title"] = title
+    track["spotify_artist"] = artist
+    track["source"] = "Spotify"
+    return track, None
+
+
 async def search_track(query):
     try:
         track = await _yt_extract(f"ytsearch1:{query}")
@@ -1079,16 +1236,19 @@ async def music_worker_queue():
 
             if err:
                 await room_send(rid, f"❌ {err}")
+                await report_music_error_to_masters(rid, source, query, err, stage="البحث")
             else:
                 ok, out = await play_track(rid, track, source)
                 if not ok and out:
                     await room_send(rid, f"❌ {out}")
+                    await report_music_error_to_masters(rid, source, query, out, stage="التنزيل/التجهيز/الإرسال")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("music queue worker failed")
             try:
                 await room_send(rid, "❌ حدث خطأ أثناء تجهيز الصوت.")
+                await report_music_error_to_masters(rid, source, query, f"{type(exc).__name__}: {exc}", stage="استثناء غير متوقع")
             except Exception:
                 pass
         finally:
@@ -1117,27 +1277,92 @@ async def stop(rid):
     return True, "⏹️ تم إيقاف الأغنية بواسطة البوت"
 
 # ----------------------------- أوامر الغرفة -----------------------------
-HELP_ROOM = """━━━━━━━━━━━━━━
-🎮 𝑨𝒍𝒈𝒂𝒃 𝒂𝒍𝒎𝒐𝒕𝒂𝒉𝒂𝒂
-━━━━━━━━━━━━━━
-⚔️ حرب | 🖐️ كف | 🥊 قتال
-🏁 سباق | 💰 رشوة | 🏀 سلة
-💣 قصف | 🐸 اضرب | 🃏 ورق
-⚽ سدد | 🥊 ملاكمة | 💼 عمل
-🌋 بركان | 👻 شبح | 🎲 مضاربة
-━━━━━━━━━━━━━━
-🎵 تشغيل [أغنية] | تيك [أغنية]
-🏆 توب | 👤 نقاطي | 🎁 الهدايا
-━━━━━━━━━━━━━━
-⚔️ حرب: يكتب لاعب «حرب» ثم ينتظر لاعباً ثانياً.
-🎯 بعد البدء: لكل لاعب 3 محاولات، والتخمين من 1 إلى 6.
-⏱️ الفاصل بين بدء الألعاب: 30 ثانية ومشترك بين جميع المستخدمين.
-🎵 طابور الأغاني: دقيقتان بين كل طلب وآخر.
-━━━━━━━━━━━━━━
-📢 الماستر: نشر [نص] | نشرصورة [رابط]
-👑 المسترات | 💍 زواج | 🎲 نرد | ✨ حظ
-⚠️ +r@كلمة@رد | mas@اسم | طرد @اسم | حظر @اسم
-━━━━━━━━━━━━━━"""
+HELP_GAMES = """━━━━━━━━ 🎮 أوامر الألعاب ━━━━━━━━
+⚔️ حرب — يبدأ/ينضم للعبة الحرب، ثم اكتب رقماً من 1 إلى 6
+🖐️ كف — تحدي كف
+🥊 قتال — قتال سريع
+🏁 سباق — سباق
+💰 رشوة — رشوة
+🏀 سلة — كرة سلة
+💣 قصف — قصف
+🐸 اضرب — اضرب الضفدع
+🃏 ورق — ورق
+⚽ سدد — تسديد
+🥊 ملاكمة — ملاكمة
+💼 عمل — وظيفة
+🌋 بركان — بركان
+👻 شبح — صيد الشبح
+🎲 مضاربة رقم — مراهنة
+🎲 حظ / نرد / تعدين / زواج
+━━━━━━━━━━━━━━━━━━━━
+كل لعبة ترسل صورة اللعبة مع النتيجة والنقاط.
+"""
+
+HELP_ROOM = """━━━━━━━━ 🤖 جميع أوامر البوت ━━━━━━━━
+[1] الحساب والنقاط
+points / نقاطي — عرض نقاطك
+توب — أفضل 10 لاعبين
+dp@الاسم — صورة المستخدم
+p@الاسم — البروفايل
+st@الاسم — حالة المستخدم
+
+[2] الموسيقى
+تشغيل اسم الأغنية — YouTube
+تيك اسم الأغنية — TikTok
+.تشغيل اسم الأغنية — Spotify (يبحث عن النسخة الصوتية)
+مشاركة — مشاركة الأغنية الحالية
+تخطي — تخطي الأغنية
+ايقاف — إيقاف الصوت
+
+[3] الألعاب
+العاب — عرض أوامر الألعاب
+""" + HELP_GAMES + """
+
+[4] الرتب والإدارة
+o@الاسم — مالك
+m@الاسم — عضوية
+n@الاسم — إزالة رتبة
+a@الاسم — إشراف
+mas@الاسم — ماستر
+umas@الاسم — إزالة ماستر
+المسترات — قائمة الماسترات
+k@الاسم — طرد
+b@الاسم — حظر
+ip@الاسم — حظر IP
+
+[5] الهدايا
+gv — عرض الهدايا
+gv@رقم_الهدية@اسم_الحساب — إرسال هدية
+
+[6] الترحيب والردود
++wc رسالة — إضافة ترحيب
++wc رسالة %id% — ترحيب مع الاسم
+clear@wc — حذف الترحيبات
+l@wc — عرض الترحيبات
+wc@on / wc@off — تفعيل/تعطيل
++r@كلمة@رد — إضافة رد
+
+[7] فلتر الكلمات
+mf@on — تشغيل الفلتر
+mf@off — إيقاف الفلتر
++mf@كلمة — إضافة كلمة ممنوعة
+-mf@كلمة — إزالة كلمة
+l@mf — عرض الكلمات
+clear@mf — حذف الكلمات
+
+[8] النشر — للماستر
+نشر نص — نشر النص في جميع الغرف
+نشر@ — اطلب الصورة ثم أرسلها، وسيتم نشرها في جميع الغرف
+نشرصورة رابط — نشر صورة برابط
+
+[9] اللغة
+lang@ar — العربية
+lang@en — English
+
+.help / help — عرض جميع الأوامر
+.more / .next — عرض القائمة التالية
+━━━━━━━━━━━━━━━━━━━━"""
+
 
 
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
@@ -1174,6 +1399,43 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         publish_pending[publish_key] = time.time()
         return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع اسم الغرفة وخيارات: ❤️ إعجاب | 👎 مااعجاب | ↩️ رد."
 
+    async def cache_publish_media(source_url):
+        """Copy an incoming image to this bot's public storage so it remains
+        accessible after the original message URL expires."""
+        if not source_url:
+            return None
+        temp_dir = Path(tempfile.mkdtemp(prefix="bot_publish_"))
+        try:
+            suffix = ".jpg"
+            low = str(source_url).lower()
+            for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                if ext in low:
+                    suffix = ext
+                    break
+            local = temp_dir / f"image{suffix}"
+            async with http.get(
+                source_url,
+                timeout=aiohttp.ClientTimeout(total=45),
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                with local.open("wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 256):
+                        f.write(chunk)
+            if local.stat().st_size < 512:
+                return None
+            return await _store_media(
+                local,
+                "publish",
+                {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp","gif":"image/gif"}.get(suffix.lstrip("."), "image/jpeg")
+            )
+        except Exception as e:
+            log.warning("publish image cache failed: %s", e)
+            return None
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     pending_at = publish_pending.get(publish_key)
     if pending_at is not None:
         if time.time() - pending_at > 120:
@@ -1181,6 +1443,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         elif message_type in ("image", "photo", "sticker") and media_url:
             publish_pending.pop(publish_key, None)
             source_room = rooms.get(rid, "الغرفة")
+            # Re-host the image on the bot's public Railway endpoint when possible.
+            public_media_url = await cache_publish_media(media_url) or media_url
             published = 0
             for target_rid in await all_room_ids():
                 try:
@@ -1191,8 +1455,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
                         f"🏠 {target_name}\n"
                         f"❤️ إعجاب   👎 عدم إعجاب   ↩️ رد"
                     )
-                    await room_send_media(target_rid, caption, media_url, m_type="image")
-                    # رسالة تفاعل مستقلة أسفل الصورة حتى تظهر حتى في الواجهات التي لا تدعم أزراراً.
+                    await room_send_media(target_rid, caption, public_media_url, m_type="image")
                     await room_send(target_rid, "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة")
                     published += 1
                 except Exception:
@@ -1279,6 +1542,9 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         data = load_welcome(); data.setdefault(str(rid), {"enabled": False, "messages": []})["enabled"] = False; save_welcome(data)
         return "⛔ تم تعطيل رسائل الترحيب."
 
+    if text.strip().lower() in ("العاب", "ألعاب", "games", "gamehelp"):
+        return HELP_GAMES
+
     if text.strip().lower() in ("gv", "هدايا", "الهدايا", "gifts"):
         return await gift_catalog_message()
 
@@ -1298,11 +1564,31 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         return None
 
     if cmd in ("تشغيل", "play", "شغل"):
+
         if not arg: return "❌ اكتب: تشغيل اسم الأغنية"
         await music_queue.put((rid, arg, "YouTube"))
         return "🎵 جاري تجهيز الأغنية من المصدر المتاح..."
 
-    if cmd in ("تيك", "tiktok", "tik"):
+    if cmd in ("مشاركة", "share"):
+        current = music_state.get(rid)
+        if not current:
+            return "❌ لا توجد أغنية حالياً للمشاركة."
+        return f"🎵 مشاركة الأغنية\n🎶 {current.get('title','المقطع')} — {current.get('artist','')}\n🔗 {current.get('spotify_url') or current.get('youtube_url') or ''}"
+
+    if cmd in (".تشغيل", "spotify", "سبوتيفاي"):
+        if not arg:
+            return "❌ اكتب: .تشغيل اسم الأغنية أو .تشغيل رابط Spotify"
+        track, err = await search_spotify(arg)
+        if err:
+            await report_music_error_to_masters(rid, "Spotify", arg, err, stage="البحث")
+            return f"❌ {err}"
+        ok, out = await play_track(rid, track, "Spotify")
+        if not ok and out:
+            await report_music_error_to_masters(rid, "Spotify", arg, out, stage="التنزيل/التجهيز/الإرسال")
+            return f"❌ {out}"
+        return None
+
+    if cmd in ("تيك", ".تيك", "tiktok", "tik"):
         if not arg: return "❌ اكتب: تيك اسم الأغنية"
         await music_queue.put((rid, arg, "TikTok"))
         return "🎵 جاري تجهيز صوت TikTok..."
@@ -1331,7 +1617,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             }
             await room_send_media(
                 rid,
-                f"⚔️ @{p_name} بدأ لعبة حرب!\n⏳ اكتب «حرب» للانضمام وانتظر خصماً.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة إذا لم تتحرك خلال دقيقتين.",
+                f"⚔️ @{p_name} بدأ لعبة الحرب!\n⏳ جاري الانتظار: اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم.",
                 GAME_IMAGES["war"],
             )
             return None
@@ -1582,7 +1868,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         ok, out = await skip(rid); return out
     if cmd in ("ايقاف", "stop"):
         ok, out = await stop(rid); return out
-    if cmd in ("مساعدة", "help"): return HELP_ROOM
+    if cmd in ("مساعدة", "help", ".help"): return HELP_ROOM
     
     return None
 
