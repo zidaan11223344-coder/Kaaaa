@@ -64,6 +64,8 @@ REPLIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replies
 MASTERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "masters.json")
 BANS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bans.json")
 ROOMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rooms.json")
+MODERATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation.json")
+WELCOME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.json")
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -94,6 +96,22 @@ OWNER = (C.get("owner_username") or USERNAME).strip().lower()
 POLL = max(1.0, float(C.get("poll_seconds", 2)))
 SEARCH_URL = C.get("music_search_url") or "https://giant-chat-app.lovable.app/api/public/search-track"
 YOUTUBE_COOKIES_PATH = str(C.get("youtube_cookies_path", "youtube_cookies.txt")).strip()
+# أسرار cookies يمكن حفظها كمتغيرات Railway، ولا يجب رفعها إلى GitHub.
+YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
+TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
+SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
+if YOUTUBE_COOKIES_ENV:
+    try:
+        Path("/tmp/youtube_cookies.txt").write_text(YOUTUBE_COOKIES_ENV, encoding="utf-8")
+        YOUTUBE_COOKIES_PATH = "/tmp/youtube_cookies.txt"
+    except Exception as _e:
+        log.warning("تعذر إنشاء YouTube cookies: %s", _e)
+TIKTOK_COOKIES_PATH = "/tmp/tiktok_cookies.txt"
+if TIKTOK_COOKIES_ENV:
+    try:
+        Path(TIKTOK_COOKIES_PATH).write_text(TIKTOK_COOKIES_ENV, encoding="utf-8")
+    except Exception as _e:
+        log.warning("تعذر إنشاء TikTok cookies: %s", _e)
 PIPED_APIS = [x.strip().rstrip("/") for x in C.get("piped_apis", [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
@@ -176,9 +194,9 @@ BOT_GIFTS = {
 TWEMOJI = "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/72x72/"
 GAME_BASE_URL = str(C.get("game_public_base_url", "")).rstrip("/")
 def game_asset(filename):
-    # الصور المحلية تُخدم من /games/ على PythonAnywhere.
-    if GAME_BASE_URL:
-        return f"{GAME_BASE_URL}/{quote(filename)}"
+    base = PUBLIC_BASE_URL or GAME_BASE_URL
+    if base:
+        return f"{base}/assets/{quote(filename)}"
     return f"assets/{filename}"
 
 GAME_IMAGES = {
@@ -227,6 +245,23 @@ def load_bans(): return load_json(BANS_PATH, {})
 def save_bans(b): save_json(BANS_PATH, b)
 def load_rooms_saved(): return load_json(ROOMS_PATH, {})
 def save_rooms_saved(r): save_json(ROOMS_PATH, r)
+def load_moderation(): return load_json(MODERATION_PATH, {"enabled": {}, "words": []})
+def save_moderation(x): save_json(MODERATION_PATH, x)
+def load_welcome(): return load_json(WELCOME_PATH, {})
+def save_welcome(x): save_json(WELCOME_PATH, x)
+
+def normalize_text(s):
+    return re.sub(r"\\s+", " ", str(s or "").strip().lower())
+
+async def check_forbidden_word(rid, text):
+    mod = load_moderation()
+    if not mod.get("enabled", {}).get(str(rid), False) or not text:
+        return None
+    normalized = normalize_text(text)
+    for word in mod.get("words", []):
+        if normalize_text(word) and normalize_text(word) in normalized:
+            return f"🚫 تم منع الرسالة بسبب الكلمة الممنوعة: {word}"
+    return None
 
 async def all_room_ids():
     """Return every room visible to the bot, not only rooms currently cached."""
@@ -423,10 +458,14 @@ def render_gift_image(gift, sender_name, receiver_name):
     return path
 
 def publish_gift_image(local_path):
-    """حفظ صورة الهدية محليًا وإرجاع رابط PythonAnywhere Static Files."""
-    base_url = str(C.get("gift_public_base_url", "")).rstrip("/")
+    """حفظ صورة الهدية وإرجاع رابط عام من Railway."""
+    base_url = str(
+        os.environ.get("PUBLIC_BASE_URL")
+        or C.get("gift_public_base_url", "")
+        or PUBLIC_BASE_URL
+    ).rstrip("/")
     if not base_url:
-        raise RuntimeError("gift_public_base_url غير موجود في config.json")
+        raise RuntimeError("لم يتم ضبط PUBLIC_BASE_URL أو gift_public_base_url")
 
     path = Path(local_path).resolve()
     render_dir = GIFT_RENDER_DIR.resolve()
@@ -442,7 +481,7 @@ def publish_gift_image(local_path):
         except OSError:
             log.warning("تعذر حذف صورة قديمة: %s", old_file)
 
-    return f"{base_url}/{quote(path.name)}"
+    return f"{base_url}/gifts/{quote(path.name)}"
 
 GIFT_ASSETS = {
     "1": GIFT_ASSET_BASE + "ALvAmhVifZhRCjXC.png",   # وردة
@@ -817,6 +856,26 @@ async def start_media_server():
         return web.FileResponse(path)
 
     app.router.add_get(f"{MEDIA_PATH}/{{name}}", media_handler)
+
+    async def public_asset_handler(request):
+        rel = request.match_info.get("path", "")
+        safe = Path(rel)
+        if ".." in safe.parts:
+            raise web.HTTPBadRequest()
+        file_path = BASE_DIR / "assets" / safe
+        if not file_path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(file_path)
+
+    async def gift_handler(request):
+        name = os.path.basename(request.match_info.get("name", ""))
+        file_path = GIFT_RENDER_DIR / name
+        if not file_path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(file_path)
+
+    app.router.add_get("/assets/{path:.*}", public_asset_handler)
+    app.router.add_get("/gifts/{name}", gift_handler)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     media_runner = runner
@@ -949,6 +1008,8 @@ async def search_tiktok(query):
                 "noplaylist": True, "format": "bestaudio/best", "socket_timeout": 25,
                 "retries": 3, "extractor_retries": 3, "cachedir": False,
             }
+            if os.path.isfile(TIKTOK_COOKIES_PATH):
+                options["cookiefile"] = TIKTOK_COOKIES_PATH
             info = None
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(urls[0], download=False)
@@ -1082,7 +1143,15 @@ HELP_ROOM = """━━━━━━━━━━━━━━
 async def handle_room(rid, text, uid, media_url=None, message_type=None):
     if await is_banned(rid, uid): return None
     p_name = await username_of(uid)
-    
+    lower_text = text.strip().lower()
+
+    admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
+                      "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
+    if not lower_text.startswith(admin_prefixes):
+        blocked = await check_forbidden_word(rid, text)
+        if blocked:
+            return blocked
+
     replies = load_replies()
     if text.strip() in replies: return replies[text.strip()]
 
@@ -1152,6 +1221,63 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             replies[parts[1].strip()] = parts[2].strip(); save_replies(replies)
             return f"✅ تم إضافة الرد لـ: {parts[1].strip()}"
         return "❌ الصيغة: +r@الكلمة@الرد"
+
+    # ---------------- فلتر الكلمات الممنوعة ----------------
+    if lower_text in ("mf@on", "mf on"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = True; save_moderation(mod)
+        return "✅ تم تفعيل فلتر الألفاظ في هذه الغرفة."
+    if lower_text in ("mf@off", "mf off"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        mod = load_moderation(); mod.setdefault("enabled", {})[str(rid)] = False; save_moderation(mod)
+        return "⛔ تم تعطيل فلتر الألفاظ في هذه الغرفة."
+    if lower_text == "clear@mf":
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        mod = load_moderation(); mod["words"] = []; save_moderation(mod)
+        return "🧹 تم حذف جميع الكلمات الممنوعة."
+    if lower_text == "l@mf":
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        words = load_moderation().get("words", [])
+        return "🚫 الكلمات الممنوعة:\n" + ("\n".join(f"{i+1}. {w}" for i,w in enumerate(words)) if words else "لا توجد كلمات.")
+    if lower_text.startswith("+mf@"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        word = text.split("@", 1)[1].strip()
+        if not word: return "❌ الصيغة: +mf@كلمة"
+        mod = load_moderation(); words = mod.setdefault("words", [])
+        if word not in words: words.append(word)
+        save_moderation(mod)
+        return f"✅ تمت إضافة الكلمة الممنوعة: {word}"
+    if lower_text.startswith("-mf@"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        word = text.split("@", 1)[1].strip()
+        mod = load_moderation(); mod["words"] = [w for w in mod.get("words", []) if normalize_text(w) != normalize_text(word)]
+        save_moderation(mod)
+        return f"✅ تمت إزالة الكلمة: {word}"
+
+    # ---------------- رسائل الترحيب ----------------
+    if lower_text.startswith("+wc "):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        msg = text.split(" ", 1)[1].strip()
+        data = load_welcome(); item = data.setdefault(str(rid), {"enabled": False, "messages": []})
+        if msg not in item["messages"]: item["messages"].append(msg)
+        save_welcome(data)
+        return "✅ تمت إضافة رسالة الترحيب."
+    if lower_text == "clear@wc":
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        data = load_welcome(); data.pop(str(rid), None); save_welcome(data)
+        return "🧹 تم حذف رسائل الترحيب."
+    if lower_text == "l@wc":
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        msgs = load_welcome().get(str(rid), {}).get("messages", [])
+        return "👋 رسائل الترحيب:\n" + ("\n".join(f"{i+1}. {m}" for i,m in enumerate(msgs)) if msgs else "لا توجد رسائل.")
+    if lower_text in ("wc@on", "wc on"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        data = load_welcome(); data.setdefault(str(rid), {"enabled": False, "messages": []})["enabled"] = True; save_welcome(data)
+        return "✅ تم تفعيل رسائل الترحيب."
+    if lower_text in ("wc@off", "wc off"):
+        if not await is_master(uid, p_name): return "🚫 للماستر فقط."
+        data = load_welcome(); data.setdefault(str(rid), {"enabled": False, "messages": []})["enabled"] = False; save_welcome(data)
+        return "⛔ تم تعطيل رسائل الترحيب."
 
     if text.strip().lower() in ("gv", "هدايا", "الهدايا", "gifts"):
         return await gift_catalog_message()

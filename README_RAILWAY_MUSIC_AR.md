@@ -42,3 +42,13 @@ Dockerfile يشغل:
 
 ## مهم
 لا تضع كلمة مرور الحساب أو مفتاح Supabase داخل GitHub. استخدم Railway Variables.
+
+
+## الإصدار Railway V2
+- `PUBLIC_BASE_URL` يستخدم للصور والأغاني والهدايا.
+- `YOUTUBE_COOKIES` متغير سري اختياري يحتوي محتوى ملف Netscape cookies.
+- `TIKTOK_COOKIES` متغير سري اختياري لـ yt-dlp.
+- `SPOTIFY_COOKIES` محفوظ كمتغير اختياري، لكن Spotify لا يوفّر بث الأغاني عبر cookies؛ يمكن استخدامه للوصول إلى البيانات فقط.
+- أوامر فلتر الكلمات: `mf@on`, `mf@off`, `+mf@كلمة`, `-mf@كلمة`, `l@mf`, `clear@mf`.
+- أوامر الترحيب: `+wc رسالة`, `wc@on`, `wc@off`, `l@wc`, `clear@wc`.
+- `نشر@` ثم إرسال صورة ينشر الصورة في الغرف التي يستطيع البوت الكتابة فيها.
