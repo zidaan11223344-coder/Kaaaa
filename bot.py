@@ -1106,10 +1106,28 @@ async def search_spotify(query):
         except Exception as e:
             log.warning("Spotify oEmbed failed: %s", e)
 
-    # Search the same title on YouTube for the actual playable audio.
-    track = await _yt_extract(f"{title} {artist}")
+    # Spotify supplies metadata/link; audio is obtained from a playable public copy.
+    track = None
+    spotify_queries = [f"{title} {artist}", f"{title} {artist} audio", f"{title} {artist} official"]
+    for sq in spotify_queries:
+        try:
+            track = await _yt_extract(sq)
+            if track:
+                break
+        except Exception as e:
+            log.warning("Spotify->YouTube search failed (%s): %s", sq, e)
     if not track:
-        return None, "تعذر العثور على نسخة صوتية للمقطع من Spotify."
+        # Keep the Spotify URL so the room can still open it without downloading.
+        if spotify_url:
+            return {
+                "title": title,
+                "artist": artist,
+                "spotify_url": spotify_url,
+                "source": "Spotify",
+                "youtube_url": None,
+                "audio_url": None,
+            }, None
+        return None, "تعذر العثور على نسخة صوتية للمقطع من Spotify، ولم يوجد رابط Spotify مباشر."
     track["spotify_url"] = spotify_url
     track["spotify_title"] = title
     track["spotify_artist"] = artist
@@ -1117,13 +1135,76 @@ async def search_spotify(query):
     return track, None
 
 
-async def search_track(query):
+async def _extract_direct_media_url(url, source_label):
+    """Extract metadata from a direct YouTube/TikTok media page URL."""
+    u = str(url or "").strip()
+    if not re.match(r"^https?://", u, re.I):
+        return None, "الرابط غير صالح"
+    if yt_dlp is None:
+        return None, "مكتبة yt-dlp غير مثبتة."
+
+    def extract():
+        options = {
+            "quiet": True, "no_warnings": True, "skip_download": True,
+            "noplaylist": True, "socket_timeout": 30, "retries": 4,
+            "extractor_retries": 4, "cachedir": False,
+            "format": "bestaudio/best",
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
+        }
+        if source_label == "YouTube" and YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
+            options["cookiefile"] = YOUTUBE_COOKIES_PATH
+        if source_label == "TikTok" and os.path.isfile(TIKTOK_COOKIES_PATH):
+            options["cookiefile"] = TIKTOK_COOKIES_PATH
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(u, download=False)
+        if not info:
+            return None
+        return {
+            "id": info.get("id"),
+            "title": info.get("title") or "المقطع",
+            "artist": info.get("uploader") or info.get("creator") or source_label,
+            "youtube_url": info.get("webpage_url") if source_label == "YouTube" else None,
+            "tiktok_url": info.get("webpage_url") if source_label == "TikTok" else None,
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration") or 0,
+            "source": source_label,
+        }
     try:
-        track = await _yt_extract(f"ytsearch1:{query}")
-        return (track, None) if track else (None, "لم أجد الأغنية المطلوبة على يوتيوب")
+        return await asyncio.to_thread(extract), None
     except Exception as e:
-        log.warning("youtube search error: %s", e)
-        return None, f"تعذر البحث عن الأغنية: {e}"
+        return None, f"{type(e).__name__}: {e}"
+
+async def search_track(query):
+    """YouTube search with several query variants. Returns the direct YouTube URL
+    even when audio download later fails, so the client can open/play it."""
+    q = str(query or "").strip()
+    if not q:
+        return None, "اكتب اسم الأغنية بعد تشغيل"
+    # تشغيل رابط YouTube مباشرة: لا نبحث عنه كنص.
+    if re.match(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", q, re.I):
+        return await _extract_direct_media_url(q, "YouTube")
+    # دعم وضع الرابط مع الأمر تشغيل أيضاً إذا كان رابط TikTok.
+    if re.match(r"^https?://(?:(?:www\.)?tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)/", q, re.I):
+        return await _extract_direct_media_url(q, "TikTok")
+    variants = [
+        q,
+        f"{q} official",
+        f"{q} audio",
+        f"{q} lyrics",
+    ]
+    errors = []
+    for variant in variants:
+        try:
+            track = await _yt_extract(variant)
+            if track and track.get("youtube_url"):
+                track["source"] = "YouTube"
+                track["search_query"] = variant
+                return track, None
+        except Exception as e:
+            errors.append(f"{variant}: {type(e).__name__}: {e}")
+            log.warning("youtube search error (%s): %s", variant, e)
+    detail = " | ".join(errors[-2:]) if errors else "لا توجد نتائج من مصادر البحث"
+    return None, f"لم أجد الأغنية المطلوبة على يوتيوب. تفاصيل البحث: {detail}"
 
 
 async def search_tiktok(query):
@@ -1174,6 +1255,7 @@ async def search_tiktok(query):
                 "id": info.get("id"), "title": info.get("title") or query,
                 "artist": info.get("uploader") or info.get("creator") or "TikTok",
                 "youtube_url": info.get("webpage_url") or urls[0],
+                "tiktok_url": info.get("webpage_url") or urls[0],
                 "thumbnail": info.get("thumbnail"), "duration": info.get("duration") or 0,
             }
         track = await asyncio.to_thread(extract)
@@ -1197,7 +1279,20 @@ async def play_track(rid, track, source_label):
     artist = track.get("artist", source_label)
     media_url = track.get("audio_url")
     if not media_url:
-        return False, "تعذر تجهيز ملف الصوت"
+        # لا نُخفي الرابط إذا فشل التنزيل: إرسال الرابط المباشر يسمح للعميل
+        # بفتحه/تشغيله إذا كان Giant Chat يدعم تشغيل روابط الوسائط.
+        direct_url = track.get("youtube_url") or track.get("spotify_url") or track.get("tiktok_url")
+        if direct_url:
+            title = track.get("title", "المقطع")
+            artist = track.get("artist", source_label)
+            await room_send(
+                rid,
+                f"🔗 تعذر تنزيل الصوت من الخادم، لكن هذا رابط التشغيل المباشر:\n"
+                f"🎵 {title} — {artist}\n"
+                f"▶️ تشغيل الرابط: {direct_url}"
+            )
+            return True, None
+        return False, "تعذر تجهيز ملف الصوت ولا يوجد رابط تشغيل مباشر"
 
     if track.get("thumbnail"):
         await room_send_media(rid, f"🖼️ {title}", track["thumbnail"], m_type="image")
@@ -1231,6 +1326,8 @@ async def music_worker_queue():
             last_music_started = time.time()
             if source == "TikTok":
                 track, err = await search_tiktok(query)
+            elif source == "Spotify":
+                track, err = await search_spotify(query)
             else:
                 track, err = await search_track(query)
 

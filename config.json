@@ -29,5 +29,7 @@
   "publish_storage": "railway",
   "publish_local_dir": "published_media",
   "publish_public_base_url": "",
-  "game_bucket": "bot-games"
+  "game_bucket": "bot-games",
+  "music_direct_link_fallback": true,
+  "music_direct_link_text": "▶️ تشغيل الرابط"
 }
