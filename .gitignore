@@ -7,3 +7,6 @@ logs/
 generated_music/
 generated_gifts/
 published_media/
+
+custom_games.json
+generated_ai/
