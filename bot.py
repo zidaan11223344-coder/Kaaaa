@@ -18,9 +18,7 @@ import uuid
 import random
 import tempfile
 import shutil
-import base64
 import subprocess
-import zipfile
 from pathlib import Path
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -28,6 +26,115 @@ from datetime import datetime, timezone
 import aiohttp
 from aiohttp import web
 import requests
+
+# ----------------------------- الذكاء الاصطناعي المحلي -----------------------------
+# لا يستخدم OpenAI ولا يحتاج OPENAI_API_KEY.
+# إذا وضعت نموذج GGUF محلياً، سيستخدم llama.cpp تلقائياً.
+try:
+    from llama_cpp import Llama
+    LOCAL_LLAMACPP_AVAILABLE = True
+except ImportError:
+    Llama = None
+    LOCAL_LLAMACPP_AVAILABLE = False
+
+LOCAL_AI_MODEL_PATH = str(
+    os.environ.get("LOCAL_AI_MODEL_PATH")
+    or ""
+).strip()
+LOCAL_AI_CTX = int(os.environ.get("LOCAL_AI_CTX", "2048"))
+LOCAL_AI_THREADS = int(os.environ.get("LOCAL_AI_THREADS", str(max(1, (os.cpu_count() or 2) - 1))))
+LOCAL_AI_AUTO = str(os.environ.get("LOCAL_AI_AUTO", "false")).strip().lower() in ("1", "true", "yes", "on")
+LOCAL_AI = None
+LOCAL_AI_LOCK = asyncio.Lock()
+
+
+def local_ai_status():
+    if LOCAL_AI is not None:
+        return "✅ الذكاء الاصطناعي المحلي يعمل بدون API."
+    if LOCAL_LLAMACPP_AVAILABLE and LOCAL_AI_MODEL_PATH and Path(LOCAL_AI_MODEL_PATH).is_file():
+        return "⏳ نموذج الذكاء الاصطناعي المحلي جاهز وسيتم تشغيله عند أول طلب."
+    return "⚠️ الذكاء الاصطناعي المحلي يعمل بوضع الردود المدمجة. لإضافة نموذج حقيقي ضع ملف GGUF محلياً واضبط LOCAL_AI_MODEL_PATH."
+
+
+def _local_builtin_reply(question, username=""):
+    """مساعد محلي خفيف يعمل حتى بدون أي نموذج أو API خارجي."""
+    q = str(question or "").strip().lower()
+    if not q:
+        return "🤖 اكتب سؤالك بعد: ai@سؤالك"
+    if q in ("مرحبا", "اهلا", "أهلا", "السلام عليكم", "hello", "hi"):
+        return f"🤖 أهلاً @{username} 👋 كيف أستطيع مساعدتك؟"
+    if "اسمك" in q:
+        return "🤖 أنا المساعد المحلي في جينات شات، ولا أحتاج إلى OpenAI API."
+    if "من انت" in q or "من أنت" in q:
+        return "🤖 أنا مساعد محلي مدمج داخل البوت. أعمل بدون مفتاح OpenAI."
+    if "كيف حالك" in q:
+        return "🤖 بخير 😄 وجاهز لمساعدتك."
+    if "الوقت" in q:
+        return "🕒 الوقت الحالي: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if "مساعدة" in q or q in ("help", ".help"):
+        return "🤖 الذكاء المحلي: ai@سؤالك | مثال: ai@ما هي أوامر البوت؟"
+    if "أوامر البوت" in q or "اوامر البوت" in q:
+        return "🤖 اكتب help لعرض أوامر البوت، وai@سؤالك للتحدث مع المساعد المحلي."
+    if "api" in q and "openai" in q:
+        return "✅ هذا الوضع لا يستخدم OPENAI_API_KEY؛ يعتمد على محرك محلي مدمج، ويمكنه استخدام نموذج GGUF محلي عند توفره."
+    return "🤖 فهمت سؤالك، لكن لا يوجد نموذج لغوي محلي مثبت حالياً. أستطيع تنفيذ الردود الأساسية بدون API. إذا أضفت نموذج GGUF محلياً سيصبح الحوار مفتوحاً بالكامل."
+
+
+async def local_ai_reply(question, username=""):
+    """توليد رد محلي: llama.cpp إن توفر، وإلا الردود المدمجة."""
+    global LOCAL_AI
+    question = str(question or "").strip()
+    if not question:
+        return "🤖 اكتب سؤالك بعد ai@"
+
+    # لا يوجد أي اتصال بخدمة ذكاء اصطناعي خارجية هنا.
+    if LOCAL_AI is None and LOCAL_LLAMACPP_AVAILABLE and LOCAL_AI_MODEL_PATH and Path(LOCAL_AI_MODEL_PATH).is_file():
+        async with LOCAL_AI_LOCK:
+            if LOCAL_AI is None:
+                try:
+                    LOCAL_AI = Llama(
+                        model_path=LOCAL_AI_MODEL_PATH,
+                        n_ctx=LOCAL_AI_CTX,
+                        n_threads=LOCAL_AI_THREADS,
+                        verbose=False,
+                    )
+                except Exception as exc:
+                    log.warning("تعذر تحميل نموذج الذكاء المحلي: %s", exc)
+                    LOCAL_AI = False
+
+    if LOCAL_AI not in (None, False):
+        try:
+            def generate():
+                result = LOCAL_AI.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": "أنت مساعد عربي مختصر وودود داخل بوت دردشة. أجب بالعربية بوضوح، ولا تدّعي الوصول إلى الإنترنت أو خدمات خارجية."},
+                        {"role": "user", "content": question},
+                    ],
+                    temperature=0.7,
+                    max_tokens=350,
+                )
+                return result["choices"][0]["message"]["content"].strip()
+            answer = await asyncio.to_thread(generate)
+            if answer:
+                return "🤖 " + answer
+        except Exception as exc:
+            log.warning("local AI generation failed: %s", exc)
+
+    return _local_builtin_reply(question, username)
+
+
+async def handle_local_ai_command(text, username=""):
+    raw = str(text or "").strip()
+    low = raw.lower()
+    if low in ("ai", "ذكاء", "الذكاء", "ai help"):
+        return "🤖 الذكاء المحلي مفعّل بدون OpenAI API.\\n📌 الاستخدام: ai@سؤالك\\n📌 مثال: ai@اشرح لي أوامر البوت"
+    if low in ("ai status", "حالة ai", "حالة الذكاء"):
+        return local_ai_status()
+    for prefix in ("ai@", "ذكاء@", "الذكاء@"):
+        if low.startswith(prefix):
+            return await local_ai_reply(raw[len(prefix):].strip(), username)
+    return None
+
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -71,7 +178,6 @@ WELCOME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome
 PUBLISHED_POSTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "published_posts.json")
 SOCIAL_EVENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_events.json")
 VIP_USERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_users.json")
-CUSTOM_GAMES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_games.json")
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -99,25 +205,11 @@ if missing:
 USERNAME = C["username"].strip()
 PASSWORD = C["password"]
 OWNER = (C.get("owner_username") or USERNAME).strip().lower()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip()
-OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2").strip()
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_BACKUP_CHAT_ID = os.environ.get("TELEGRAM_BACKUP_CHAT_ID", "").strip()
-AI_MAX_LOG_LINES = max(20, int(os.environ.get("AI_MAX_LOG_LINES", "120")))
 POLL = max(1.0, float(C.get("poll_seconds", 2)))
 SEARCH_URL = C.get("music_search_url") or "https://giant-chat-app.lovable.app/api/public/search-track"
 YOUTUBE_COOKIES_PATH = str(C.get("youtube_cookies_path", "youtube_cookies.txt")).strip()
 # أسرار cookies يمكن حفظها كمتغيرات Railway، ولا يجب رفعها إلى GitHub.
 YOUTUBE_COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
-# Optional multiple YouTube sessions. Use only cookies belonging to accounts you control.
-# The bot never prints the cookie contents.
-YOUTUBE_COOKIE_ENVS = [
-    (name, os.environ.get(name, "").strip())
-    for name in ["YOUTUBE_COOKIES", *[f"YOUTUBE_COOKIES_{i}" for i in range(1, 11)]]
-]
-YOUTUBE_COOKIE_FILES = []
-YOUTUBE_COOKIE_INDEX = 0
 TIKTOK_COOKIES_ENV = os.environ.get("TIKTOK_COOKIES", "").strip()
 SPOTIFY_COOKIES_ENV = os.environ.get("SPOTIFY_COOKIES", "").strip()
 YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
@@ -168,26 +260,17 @@ def _write_cookie_file(raw, path):
         return None
 
 
-# Load up to 11 manually exported cookie sets from Railway variables.
-# Files are stored only in /tmp and are never logged.
-for _idx, (_name, _raw) in enumerate(YOUTUBE_COOKIE_ENVS):
-    if not _raw:
-        continue
-    _path = f"/tmp/youtube_cookies_{_idx}.txt"
-    _fixed = _write_cookie_file(_raw, _path)
-    if _fixed:
-        YOUTUBE_COOKIE_FILES.append(_fixed)
+if YOUTUBE_COOKIES_ENV:
+    _yt_cookie_file = _write_cookie_file(YOUTUBE_COOKIES_ENV, "/tmp/youtube_cookies.txt")
+    if _yt_cookie_file:
+        YOUTUBE_COOKIES_PATH = _yt_cookie_file
     else:
-        log.warning("%s موجود لكنه غير صالح بصيغة Netscape؛ تم تجاهله.", _name)
-
-if YOUTUBE_COOKIE_FILES:
-    YOUTUBE_COOKIES_PATH = YOUTUBE_COOKIE_FILES[0]
+        log.warning("YOUTUBE_COOKIES موجود لكنه غير صالح بصيغة Netscape؛ تم تجاهله.")
 elif YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
     _fixed = _write_cookie_file(Path(YOUTUBE_COOKIES_PATH).read_text(encoding="utf-8", errors="ignore"),
-                                "/tmp/youtube_cookies_0.txt")
+                                "/tmp/youtube_cookies.txt")
     if _fixed:
         YOUTUBE_COOKIES_PATH = _fixed
-        YOUTUBE_COOKIE_FILES.append(_fixed)
 
 TIKTOK_COOKIES_PATH = "/tmp/tiktok_cookies.txt"
 if TIKTOK_COOKIES_ENV:
@@ -196,20 +279,12 @@ if TIKTOK_COOKIES_ENV:
 
 
 def has_youtube_cookies():
-    return bool(YOUTUBE_COOKIE_FILES) or (bool(YOUTUBE_COOKIES_PATH) and os.path.isfile(YOUTUBE_COOKIES_PATH))
-
-
-def get_youtube_cookie_files():
-    """Return the configured YouTube cookie files without exposing their contents."""
-    files = [p for p in YOUTUBE_COOKIE_FILES if os.path.isfile(p)]
-    if not files and YOUTUBE_COOKIES_PATH and os.path.isfile(YOUTUBE_COOKIES_PATH):
-        files = [YOUTUBE_COOKIES_PATH]
-    return files
+    return bool(YOUTUBE_COOKIES_PATH) and os.path.isfile(YOUTUBE_COOKIES_PATH)
 
 
 def youtube_cookie_status():
     if not has_youtube_cookies():
-        return False, "لم يتم العثور على ملف Cookies صالح في Railway (YOUTUBE_COOKIES أو YOUTUBE_COOKIES_1..YOUTUBE_COOKIES_10)."
+        return False, "لم يتم العثور على ملف Cookies صالح في Railway (YOUTUBE_COOKIES)."
     try:
         text = Path(YOUTUBE_COOKIES_PATH).read_text(encoding="utf-8", errors="ignore")
         rows = []
@@ -225,7 +300,7 @@ def youtube_cookie_status():
         return False, f"تعذر قراءة ملف Cookies: {type(e).__name__}: {e}"
 
 
-def yt_base_options(source_label="YouTube", cookie_file=None):
+def yt_base_options(source_label="YouTube"):
     """خيارات yt-dlp موحّدة لكل مصادر الصوت.
 
     مهم: عند استخدام cookies يجب عدم استخدام عميل android/ios لأن يوتيوب
@@ -248,10 +323,8 @@ def yt_base_options(source_label="YouTube", cookie_file=None):
         client_list = [x.strip() for x in clients.split(",") if x.strip()]
         if not client_list:
             client_list = ["default", "web_embedded"]
-        if cookie_file and os.path.isfile(cookie_file):
-            options["cookiefile"] = cookie_file
-        elif has_youtube_cookies():
-            options["cookiefile"] = get_youtube_cookie_files()[0]
+        if has_youtube_cookies():
+            options["cookiefile"] = YOUTUBE_COOKIES_PATH
         ex = {"youtube": {"player_client": client_list}}
         if YOUTUBE_PO_TOKEN:
             # الصيغة التي يفهمها yt-dlp: client.gvs+TOKEN أو client.player+TOKEN.
@@ -315,7 +388,23 @@ music_queue = asyncio.Queue()      # room_id, query, source, requester_id, reque
 music_state = {}     # room_id -> آخر أغنية شغّلها البوت
 music_last_by_user = {}  # user_id -> آخر طلب أغنية، فاصل مستقل دقيقتان لكل مستخدم
 music_tasks = {}      # room_id -> مهمة البحث/التشغيل الخلفية
-publish_pending = {}  # (room_id, user_id) -> {created_at, description}
+publish_pending = {}  # (room_id, user_id) -> وقت طلب نشر@
+PUBLIC_ID_LOCK = asyncio.Lock()  # حماية مولّد الأكواد العامة القصيرة
+
+async def new_public_post_id(posts=None):
+    """إنشاء كود عام من 3 أرقام فقط (100..999).
+
+    الكود لا يستخدم UUID ولا يظهر أي معرّف طويل للمستخدم.
+    نتحقق من المنشورات المحفوظة حتى لا يتكرر الكود مع أغنية/نشر سابق.
+    """
+    async with PUBLIC_ID_LOCK:
+        posts = posts if isinstance(posts, dict) else load_published_posts()
+        used = {str(k) for k in posts.keys()}
+        used.update(str(v.get("post_id")) for v in posts.values() if isinstance(v, dict) and v.get("post_id"))
+        available = [str(n) for n in range(100, 1000) if str(n) not in used]
+        if not available:
+            raise RuntimeError("تم استنفاد أكواد المنشورات الثلاثية (100-999).")
+        return random.choice(available)
 SOCIAL_SEEN = set()
 SOCIAL_WEBHOOK_TOKEN = str(os.environ.get("SOCIAL_WEBHOOK_TOKEN") or C.get("social_webhook_token", "")).strip()
 http: aiohttp.ClientSession = None
@@ -828,185 +917,6 @@ async def dm_send(uid, text):
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
     }).execute())
 
-async def dm_send_media(uid, text, media_url, m_type="image"):
-    envelope = {
-        "v": 1, "id": str(uuid.uuid4()), "content": text or "", "message_type": m_type,
-        "media_url": media_url, "media_duration_ms": None, "reply_to_id": None, "created_at": now_iso()
-    }
-    await run(lambda: sb.table("dm_relay").insert({
-        "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
-    }).execute())
-
-
-def _code4():
-    return ''.join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
-
-async def register_social_codes(post_id, owner_id, owner_name, kind, title="", room_id=None):
-    # كود واحد عشوائي من 4 خانات لكل منشور/أغنية، وتستخدمه جميع التفاعلات.
-    code = _code4()
-    codes = {
-        "like": code, "love": code, "dislike": code,
-        "comment": code, "report": code,
-    }
-    posts = load_published_posts()
-    item = posts.get(str(post_id), {})
-    item.update({
-        "post_id": str(post_id), "owner_id": str(owner_id), "owner_name": owner_name,
-        "type": kind, "title": title, "source_room_id": str(room_id) if room_id else item.get("source_room_id"),
-        "reaction_codes": codes,
-    })
-    posts[str(post_id)] = item
-    save_published_posts(posts)
-    return codes
-
-async def handle_social_reaction(rid, text, uid, p_name):
-    # Supported formats, matching the UI shown in the supplied screenshots:
-    # lk@AB12 / lv@AB12 / dl@AB12 / cm@AB12 text / report@AB12 text
-    raw = str(text or "").strip()
-    m = re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", raw, re.I | re.S)
-    if not m:
-        return None
-    action, code, extra = m.group(1).lower(), m.group(2).upper(), (m.group(3) or "").strip()
-    posts = load_published_posts()
-    found = None
-    post = None
-    for pid, item in posts.items():
-        codes = item.get("reaction_codes") or {}
-        for key, value in codes.items():
-            if str(value).upper() == code:
-                found = key; post = item; post_id = pid; break
-        if found: break
-    if not post:
-        return "❌ كود التفاعل غير صالح أو انتهت صلاحيته."
-
-    owner_id = str(post.get("owner_id") or "")
-    if not owner_id:
-        return "❌ تعذر تحديد صاحب المنشور."
-    if owner_id == str(uid):
-        return "⚠️ لا يمكنك تسجيل تفاعل على منشورك بنفس حسابك."
-
-    labels = {"like":"👍 إعجاب", "love":"❤️ أحببتة", "dislike":"👎 عدم إعجاب", "comment":"💬 تعليق", "report":"🚨 إبلاغ"}
-    if action in ("cm", "report") and not extra:
-        return f"❌ اكتب: {action}@{code} النص"
-    action_key = {"lk":"like", "lv":"love", "dl":"dislike", "cm":"comment", "report":"report"}[action]
-    event = {
-        "id": str(uuid.uuid4()), "post_id": str(post_id), "type": action_key,
-        "actor_id": str(uid), "actor_name": p_name, "owner_id": owner_id,
-        "text": extra, "room_id": str(rid), "created_at": now_iso(),
-    }
-    events = load_social_events()
-    events[event["id"]] = event
-    save_social_events(events)
-
-    title = post.get("title") or ("منشور صورة" if post.get("type") == "image" else "أغنية")
-    room_name = rooms.get(rid, "الغرفة")
-    if action_key == "comment":
-        notification = (f"💬 تعليق جديد على منشورك\n🎵/🖼️ {title}\n"
-                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 {extra}")
-    elif action_key == "report":
-        notification = (f"🚨 بلاغ على منشورك\n🎵/🖼️ {title}\n"
-                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 السبب: {extra}")
-    else:
-        notification = (f"{labels[action_key]} على منشورك\n"
-                        f"🎵/🖼️ {title}\n👤 من: @{p_name}\n🏠 الغرفة: {room_name}")
-    try:
-        await dm_send(owner_id, notification)
-    except Exception:
-        log.exception("social private notification failed")
-    return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
-
-async def telegram_find_chat_id():
-    """Find the latest private Telegram chat that interacted with this bot.
-    TELEGRAM_BACKUP_CHAT_ID is optional; the user only needs to send /start to the bot once.
-    """
-    if not TELEGRAM_BOT_TOKEN:
-        return None, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
-    if TELEGRAM_BACKUP_CHAT_ID:
-        return TELEGRAM_BACKUP_CHAT_ID, None
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        async with http.get(url, params={"limit": 100, "allowed_updates": json.dumps(["message"])},
-                            timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status >= 400 or not body.get("ok"):
-                return None, f"❌ تعذر الوصول إلى Telegram API: HTTP {resp.status}"
-            updates = body.get("result") or []
-            for update in reversed(updates):
-                msg = update.get("message") or {}
-                chat = msg.get("chat") or {}
-                if chat.get("type") == "private" and chat.get("id") is not None:
-                    return str(chat["id"]), None
-            return None, "⚠️ لم أجد محادثة خاصة مع البوت. أرسل /start إلى بوت Telegram أولاً ثم أعد أمر نسخ احتياطي."
-    except Exception as exc:
-        return None, f"❌ تعذر تحديد محادثة Telegram: {type(exc).__name__}: {exc}"
-
-async def telegram_backup():
-    """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
-    if not TELEGRAM_BOT_TOKEN:
-        return False, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
-    chat_id, chat_error = await telegram_find_chat_id()
-    if not chat_id:
-        return False, chat_error
-    tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
-    archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
-    try:
-        include = ["rooms.json", "masters.json", "bans.json", "moderation.json", "welcome.json",
-                   "replies.json", "points.json", "vip_users.json", "custom_games.json", "published_posts.json", "social_events.json"]
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-            # config بدون كلمات مرور/مفاتيح. الأسرار لا تدخل النسخة الاحتياطية.
-            safe_config = dict(C)
-            for secret_key in ("password", "supabase_key", "youtube_cookies", "api_key", "openai_api_key"):
-                safe_config.pop(secret_key, None)
-            z.writestr("config.safe.json", json.dumps(safe_config, ensure_ascii=False, indent=2))
-            for name in include:
-                path = BASE_DIR / name
-                if path.is_file(): z.write(path, arcname=name)
-            logp = BASE_DIR / "logs" / "bot.log"
-            if logp.is_file(): z.write(logp, arcname="logs/bot.log")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        form = aiohttp.FormData()
-        form.add_field("chat_id", chat_id)
-        form.add_field("caption", "📦 نسخة احتياطية آمنة للبوت\n🔐 تم استبعاد مفاتيح API وكوكيز YouTube.")
-        form.add_field("document", archive.open("rb"), filename=archive.name, content_type="application/zip")
-        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                return False, f"❌ فشل رفع النسخة إلى Telegram: HTTP {resp.status} {body[:300]}"
-        return True, "✅ تم إنشاء ورفع النسخة الاحتياطية إلى Telegram."
-    except Exception as exc:
-        log.exception("telegram backup failed")
-        return False, f"❌ تعذر إنشاء النسخة الاحتياطية: {type(exc).__name__}: {exc}"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-async def share_music_to_user(sender_uid, target_name, current):
-    target = str(target_name or "").strip().lstrip("@")
-    if not target or not current:
-        return "❌ الصيغة: مشاركة@اسم_الشخص"
-    rows, _ = await table_select(lambda: sb.table("profiles").select("id,username").ilike("username", target).limit(1).execute())
-    if not rows:
-        return f"❌ الحساب @{target} غير موجود."
-    receiver = rows[0]
-    title = current.get("title", "المقطع")
-    artist = current.get("artist", "")
-    media = current.get("audio_url") or current.get("youtube_url") or current.get("tiktok_url")
-    if not media:
-        return "❌ لا يوجد ملف صوتي أو رابط صالح للمشاركة."
-    await dm_send(receiver["id"], f"🎵 تمت مشاركة أغنية معك من @{await username_of(sender_uid)}\n🎶 {title} — {artist}")
-    await dm_send_media(receiver["id"], f"▶️ {title}", media, "voice")
-    return f"✅ تمت مشاركة «{title}» مع @{receiver.get('username') or target} في الخاص."
-
-async def user_presence(uid, username):
-    rows, _ = await table_select(lambda: sb.table("room_members").select("room_id").eq("user_id", uid).execute())
-    room_ids = [r.get("room_id") for r in rows or [] if r.get("room_id")]
-    names = []
-    if room_ids:
-        rooms_rows, _ = await table_select(lambda: sb.table("rooms").select("id,name").in_("id", room_ids).execute())
-        names = [r.get("name") or str(r.get("id")) for r in rooms_rows or []]
-    if names:
-        return f"🟢 @{username} متصل حالياً\n🏠 الغرف: " + ", ".join(names)
-    return f"⚪ @{username} غير ظاهر حالياً في أي غرفة متصلة بالبوت."
-
 async def _master_user_ids():
     """Resolve saved master usernames/IDs to profile IDs for private diagnostics."""
     result = set()
@@ -1148,8 +1058,8 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
         # إذا كانت Cookies موجودة، نستخدم yt-dlp أولاً حتى يستفيد من جلسة YouTube.
         prefer_ytdlp = source_label == "YouTube" and has_youtube_cookies()
 
-        def download_with_format(fmt, suffix="audio", use_cookies=True, clients=None, cookie_file=None):
-            options = yt_base_options(source_label, cookie_file=cookie_file)
+        def download_with_format(fmt, suffix="audio", use_cookies=True, clients=None):
+            options = yt_base_options(source_label)
             if source_label == "YouTube":
                 # بعض جلسات YouTube في أغسطس 2026 تعطي "The page needs to be reloaded"
                 # عند تمرير Cookies مع tv/web_safari. نجرّب أولاً بدون cookies، ثم
@@ -1181,32 +1091,27 @@ async def _yt_download_audio(page_url, source_label, piped_api=None, video_id=No
             if source_label == "YouTube":
                 # محاولة 1: بدون cookies؛ هذا يتجنب مشكلة YouTube الحالية مع بعض الجلسات المسجلة.
                 for idx, fmt in enumerate(formats):
-                    attempts.append((idx, fmt, False, ["default", "web_embedded"], None, -1))
-                # Try each configured YouTube session separately.
-                cookie_files = get_youtube_cookie_files()
-                base = len(attempts)
-                for account_idx, cookie_file in enumerate(cookie_files):
+                    attempts.append((idx, fmt, False, ["default", "web_embedded"]))
+                # محاولة 2: cookies صحيحة مع العملاء الموصى بهم حالياً.
+                if has_youtube_cookies():
+                    base = len(attempts)
                     for j, fmt in enumerate(formats):
-                        attempts.append((
-                            base + account_idx * len(formats) + j,
-                            fmt, True, ["default", "web_embedded"], cookie_file, account_idx
-                        ))
+                        attempts.append((base + j, fmt, True, ["default", "web_embedded"]))
             else:
-                attempts = [(idx, fmt, True, None, None, 0) for idx, fmt in enumerate(formats)]
-            for idx, fmt, use_cookies, clients, cookie_file, account_idx in attempts:
+                attempts = [(idx, fmt, True, None) for idx, fmt in enumerate(formats)]
+
+            for idx, fmt, use_cookies, clients in attempts:
                 try:
                     for p in temp_dir.glob("*"):
                         if p.is_file() and p.suffix not in (".part", ".ytdl"):
                             try: p.unlink()
                             except OSError: pass
-                    await asyncio.to_thread(
-                        download_with_format, fmt, f"audio_{idx}", use_cookies, clients, cookie_file
-                    )
+                    await asyncio.to_thread(download_with_format, fmt, f"audio_{idx}", use_cookies, clients)
                     files = [p for p in temp_dir.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl") and p.stat().st_size > 4096]
                     if files:
                         return max(files, key=lambda p: p.stat().st_size)
                 except Exception as e:
-                    cookie_tag = f"account-{account_idx + 1}" if use_cookies else "بدون-cookies"
+                    cookie_tag = "cookies" if use_cookies else "بدون-cookies"
                     errors.append(f"yt-dlp [{fmt}][{cookie_tag}]: {type(e).__name__}: {e}")
                     log.warning("yt-dlp audio failed (%s,%s): %s", fmt, cookie_tag, e)
             return None
@@ -1848,31 +1753,24 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
 
     # تسجيل الأغنية كمنشور بدون إنشاء صورة للأغنية، حتى تبقى التفاعلات
     # (إعجاب/حب/تعليق) مرتبطة بصاحب الطلب عبر post_id.
-    post_id = str(uuid.uuid4())
     posts = load_published_posts()
+    post_id = await new_public_post_id(posts)
     posts[post_id] = {
         "post_id": post_id, "owner_id": str(requester_id), "owner_name": requester_name,
         "source_room_id": str(rid), "type": "music", "title": title,
         "media_url": media_url, "audio_url": media_url, "created_at": now_iso()
     }
     save_published_posts(posts)
-    codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
 
-    # نفس شكل بطاقة SONG BROADCAST في الصورة المرسلة، مع كود واحد متغير لكل أغنية.
+    # المطلوب: تفاصيل الأغنية كنص أولاً، ثم رسالة الصوت وحدها. لا صورة للأغنية.
     caption = (
-        "🎵 SONG BROADCAST\n"
-        ".sa Music name\n"
-        f"🎤 {requester_name}\n"
-        f"{title}\n\n"
-        f"⏱️ Source: {source_label}\n"
-        f"🆔 {codes['like']}\n"
-        f"💬 Room: {source_room}\n"
-        "━━━━━━━━━━━━━\n"
-        f"👍 lk@{codes['like']}\n"
-        f"❤️ lv@{codes['like']}\n"
-        f"👎 dl@{codes['like']}\n"
-        f"💬 cm@{codes['like']} msg\n"
-        f"🚨 report@{codes['like']} msg"
+        f"🎵 جاري تشغيل الأغنية\n"
+        f"🎶 {title} — {artist}\n"
+        f"👤 الطلب بواسطة: @{requester_name}\n"
+        f"🏠 الغرفة: {source_room}\n"
+        f"🆔 {post_id}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
     )
     targets = await all_room_ids()
     for target_rid in targets:
@@ -2009,7 +1907,7 @@ HELP_GAMES = """━━━━━━━━ 🎮 أوامر الألعاب ━━�
 """
 
 HELP_ROOM = """━━━━━━━━ 🤖 جميع أوامر البوت ━━━━━━━━
-[1] الحساب والنقاط
+[0] الذكاء الاصطناعي المحلي\nai@سؤالك — سؤال للمساعد المحلي بدون API\nai status — حالة الذكاء المحلي\n\n[1] الحساب والنقاط
 points / نقاطي — عرض نقاطك
 توب — أفضل 10 لاعبين
 dp@الاسم — صورة المستخدم
@@ -2153,16 +2051,18 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     p_name = await username_of(uid)
     lower_text = text.strip().lower()
 
-    social_reply = await handle_social_reaction(rid, text, uid, p_name)
-    if social_reply is not None:
-        return social_reply
-
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
     if not lower_text.startswith(admin_prefixes):
         blocked = await check_forbidden_word(rid, text)
         if blocked:
             return blocked
+
+    # ---------------- الذكاء الاصطناعي المحلي ----------------
+    # لا يحتاج OPENAI_API_KEY ولا يرسل السؤال إلى OpenAI.
+    ai_reply = await handle_local_ai_command(text, p_name)
+    if ai_reply is not None:
+        return ai_reply
 
     replies = load_replies()
     if text.strip() in replies: return replies[text.strip()]
@@ -2184,16 +2084,13 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     # نشر@: الماستر يطلب صورة في رسالة لاحقة، ثم ينشرها في كل الغرف.
     publish_key = (rid, uid)
-    if text.strip() == "نشر@" or text.strip().startswith("نشر@") or text.strip() == "publish@" or text.strip().startswith("publish@"):
+    if text.strip() in ("نشر@", "publish@"):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
-        description = ""
-        if "@" in text:
-            description = text.split("@", 1)[1].strip()
-        publish_pending[publish_key] = {"created_at": time.time(), "description": description}
-        return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع الوصف الذي كتبته."
+        publish_pending[publish_key] = time.time()
+        return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع اسم الغرفة وخيارات: ❤️ إعجاب | 👎 مااعجاب | ↩️ رد."
 
     async def cache_publish_media(source_url):
         """Copy an incoming image to this bot's public storage so it remains
@@ -2232,10 +2129,8 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    pending = publish_pending.get(publish_key)
-    if pending is not None:
-        pending_at = pending.get("created_at", 0) if isinstance(pending, dict) else pending
-        description = pending.get("description", "") if isinstance(pending, dict) else ""
+    pending_at = publish_pending.get(publish_key)
+    if pending_at is not None:
         if time.time() - pending_at > 120:
             publish_pending.pop(publish_key, None)
         elif message_type in ("image", "photo", "sticker") and media_url:
@@ -2243,29 +2138,24 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             source_room = rooms.get(rid, "الغرفة")
             # Re-host the image on the bot's public Railway endpoint when possible.
             public_media_url = await cache_publish_media(media_url) or media_url
-            post_id = str(uuid.uuid4())
             posts = load_published_posts()
-            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "type": "image", "title": description or "منشور صورة", "created_at": now_iso()}
+            post_id = await new_public_post_id(posts)
+            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "type": "publication", "media_url": public_media_url, "created_at": now_iso()}
             save_published_posts(posts)
-            codes = await register_social_codes(post_id, uid, p_name, "image", description or "منشور صورة", rid)
             published = 0
             for target_rid in await all_room_ids():
                 try:
+                    target_name = rooms.get(target_rid, "الغرفة")
                     caption = (
-                        "✨════════════✨\n"
-                        "🖼️ منشور الصورة من:\n"
-                        f"@{p_name}\n"
-                        "📝 الوصف: " + (description or "بدون وصف") + "\n"
-                        "━━━━━━━━━━━━━\n"
-                        f"👍 {codes['like']}@Like\n"
-                        f"❤️ {codes['love']}@loved\n"
-                        f"👎 {codes['dislike']}@Dislike\n"
-                        f"💬 {codes['comment']}@msg\n"
-                        f"🚨 {codes['report']}@report\n"
-                        "✨════════════✨"
+                        f"📢 نشر@ من غرفة: {source_room}\n"
+                        f"👤 بواسطة: @{p_name}\n"
+                        f"🆔 {post_id}\n"
+                        f"🏠 {target_name}\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
                     )
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
-                    await room_send(target_rid, "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة")
+                    await room_send(target_rid, f"🆔 {post_id}\n❤️ إعجاب | 👎 عدم إعجاب | 💖 أحببته | 💬 تعليق")
                     published += 1
                 except Exception:
                     log.exception("publish@ failed for room %s", target_rid)
@@ -2420,22 +2310,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if vip_error:
             return vip_error
 
-    if cmd == ".sa":
-        cmd = "تشغيل"
-
-    if text.strip().lower().startswith("is@"):
-        target = text.split("@", 1)[1].strip().lstrip("@")
-        rows, _ = await table_select(lambda: sb.table("profiles").select("id,username").ilike("username", target).limit(1).execute())
-        if not rows:
-            return f"❌ الحساب @{target} غير موجود."
-        return await user_presence(rows[0]["id"], rows[0].get("username") or target)
-
-    if text.strip().lower().startswith("مشاركة@"):
-        vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
-        if vip_error: return vip_error
-        target = text.split("@", 1)[1].strip()
-        return await share_music_to_user(uid, target, music_state.get(rid))
-
     if cmd in ("تشغيل", "play", "شغل"):
         vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
         if vip_error: return vip_error
@@ -2499,7 +2373,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             }
             await room_send_media(
                 rid,
-                f"🚢 بدأت لعبة حرب السفن | Battleship Started\n👤 اللاعب: @{p_name}\n♟️ السفينة مخفية | ينتظر الخصم\n🎯 اختر رقماً من 1 إلى 6 بعد الانضمام\n⌛ اكتب حرب للانضمام.",
+                f"⚔️ @{p_name} بدأ لعبة الحرب!\n⏳ جاري الانتظار: اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم.",
                 GAME_IMAGES["war"],
             )
             return None
@@ -2516,7 +2390,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["expires_at"] = now + 120
             await room_send_media(
                 rid,
-                f"🚢 بدأت لعبة حرب السفن | Battleship Started\n👤 @{game['p1_name']} × @{p_name}\n♟️ السفينة مخفية\n\n🎯 لوحة الخصم | Opponent's Board\n1 | 2 | 3 | 4 | 5 | 6\n━━━━━━━━━━━━━━\nAttempts | المحاولات المتبقية: 3\nChoose a number (1-6) | اختر رقماً من 1 إلى 6",
+                f"⚔️ بدأت الحرب!\n👤 @{game['p1_name']} ضد @{p_name}\n🎯 دور @{game['p1_name']} — اكتب رقماً من 1 إلى 6.\n🔥 لكل لاعب 3 محاولات.\n⌛ المهلة دقيقتان لكل حركة.",
                 GAME_IMAGES["war"],
             )
             return None
@@ -2575,7 +2449,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["expires_at"] = now + 120
             await room_send(
                 rid,
-                f"❌ الرقم {n} ليس السفينة.\n🎯 لوحة الخصم | Opponent's Board\n1 | 2 | 3 | 4 | 5 | 6\n━━━━━━━━━━━━━━\nAttempts | المحاولات المتبقية: {remaining}\n🔄 دور @{next_name}\nChoose a number (1-6) | اختر رقماً من 1 إلى 6"
+                f"❌ الرقم {n} ليس السفينة.\n🔄 دور @{next_name} — بقيت له {remaining} محاولات."
             )
             return None
 
@@ -2710,27 +2584,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         "نرد": ("dice", 15, -10, 50, "🎲 فوز بالنرد!", "🎲 خسارة بالنرد..")
     }
     
-    custom_games = load_custom_games()
-    custom = custom_games.get(cmd)
-    if custom:
-        vip_error = await require_vip(uid, p_name, "أوامر الألعاب")
-        if vip_error:
-            return vip_error
-        cd_error = await require_game_cooldown(cmd)
-        if cd_error:
-            return cd_error
-        win = random.randint(1, 100) <= int(custom.get("win_chance", 50))
-        delta = int(custom.get("win_points", 20)) if win else int(custom.get("lose_points", -5))
-        add_points(uid, p_name, delta)
-        image_url = custom.get("image_url")
-        if image_url:
-            try:
-                await room_send_media(rid, "", image_url, m_type="image")
-            except Exception:
-                pass
-        msg = custom.get("win_message") if win else custom.get("lose_message")
-        return f"{msg} @{p_name}\n💰 {'+' if delta >= 0 else ''}{delta} نقطة"
-
     if cmd in games_map:
         cd_error = await require_game_cooldown(cmd)
         if cd_error:
@@ -2770,220 +2623,6 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     return None
 
 # ----------------------------- الحلقات -----------------------------
-# ----------------------------- الذكاء الاصطناعي / الصيانة -----------------------------
-def load_custom_games():
-    data = load_json(CUSTOM_GAMES_PATH, {})
-    return data if isinstance(data, dict) else {}
-
-def save_custom_games(data):
-    save_json(CUSTOM_GAMES_PATH, data)
-
-def _safe_ai_text(text, limit=12000):
-    text = str(text or "")
-    text = re.sub(r"(?i)(youtube_cookies(?:_\d+)?|authorization|api[_-]?key|bearer)\s*[:=]\s*[^\s]+", r"\1=[REDACTED]", text)
-    return text[-limit:]
-
-def _tail_log(lines=120):
-    path = Path("logs/bot.log")
-    if not path.is_file():
-        return "لا يوجد ملف سجل حالياً."
-    try:
-        data = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return "\n".join(data[-lines:])
-    except Exception as exc:
-        return f"تعذر قراءة السجل: {type(exc).__name__}: {exc}"
-
-async def ai_response(prompt, max_output=2500):
-    if not OPENAI_API_KEY:
-        return None, "⚠️ الذكاء الاصطناعي غير مفعّل. أضف OPENAI_API_KEY في Railway Variables."
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": prompt,
-        "max_output_tokens": max_output,
-    }
-    try:
-        async with http.post(
-            "https://api.openai.com/v1/responses",
-            json=payload,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=90),
-        ) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status >= 400:
-                return None, f"❌ OpenAI HTTP {resp.status}: {_safe_ai_text(body.get('error', body), 900)}"
-            text = body.get("output_text")
-            if text:
-                return text.strip(), None
-            # fallback for response objects that don't expose output_text
-            parts = []
-            for item in body.get("output", []) or []:
-                for content in item.get("content", []) or []:
-                    if content.get("type") == "output_text" and content.get("text"):
-                        parts.append(content["text"])
-            return ("\n".join(parts).strip() or "❌ لم يُرجع النموذج نصاً."), None
-    except Exception as exc:
-        return None, f"❌ تعذر الاتصال بالذكاء الاصطناعي: {type(exc).__name__}: {exc}"
-
-async def ai_diagnose(problem=""):
-    report = {
-        "python": sys.version.split()[0],
-        "yt_dlp": getattr(yt_dlp, "version", None) if yt_dlp else "غير مثبت",
-        "pillow": PIL_AVAILABLE,
-        "youtube_cookie_sets": len(YOUTUBE_COOKIE_FILES),
-        "rooms": len(rooms),
-        "custom_games": len(load_custom_games()),
-        "ffmpeg": bool(shutil.which("ffmpeg")),
-    }
-    prompt = f"""أنت مهندس صيانة لبوت Python يعمل على Railway. لا تقترح استخراج كلمات مرور أو Cookies أو أسرار. حلل المشكلة واقترح إصلاحات آمنة وقابلة للتنفيذ.
-المشكلة التي ذكرها المالك: {_safe_ai_text(problem, 1200) or 'افحص حالة البوت بالكامل'}
-حالة التشغيل: {json.dumps(report, ensure_ascii=False)}
-آخر السجل:
-{_safe_ai_text(_tail_log(AI_MAX_LOG_LINES), 10000)}
-أعد الرد بالعربية بهذا الترتيب: التشخيص، السبب المحتمل، الأمر الذي يجب تنفيذه، وطريقة التحقق. لا تطبع أي سر أو قيمة Cookie أو API key."""
-    return await ai_response(prompt, 2200)
-
-async def run_repair_check(kind):
-    kind = normalize_text(kind)
-    if kind in ("فحص", "check", "عام", "all"):
-        compile_ok = True
-        compile_error = ""
-        try:
-            compile(Path(__file__).read_text(encoding="utf-8"), str(Path(__file__)))
-        except Exception as exc:
-            compile_ok = False; compile_error = f"{type(exc).__name__}: {exc}"
-        return ("🧪 فحص البوت\n"
-                f"• Python syntax: {'✅' if compile_ok else '❌ ' + compile_error}\n"
-                f"• yt-dlp: {'✅' if yt_dlp else '❌ غير مثبت'}\n"
-                f"• FFmpeg: {'✅' if shutil.which('ffmpeg') else '❌ غير موجود'}\n"
-                f"• Pillow: {'✅' if PIL_AVAILABLE else '❌ غير مثبت'}\n"
-                f"• YouTube cookie sets: {len(YOUTUBE_COOKIE_FILES)}\n"
-                f"• الألعاب المضافة بالذكاء: {len(load_custom_games())}\n"
-                f"• الغرف الحالية: {len(rooms)}")
-    if kind in ("موسيقى", "music", "اغاني"):
-        checks = []
-        checks.append(f"yt-dlp: {'OK' if yt_dlp else 'MISSING'}")
-        checks.append(f"ffmpeg: {'OK' if shutil.which('ffmpeg') else 'MISSING'}")
-        checks.append(f"YouTube sessions: {len(YOUTUBE_COOKIE_FILES)}")
-        return "🎵 فحص الموسيقى\n• " + "\n• ".join(checks) + "\n💡 إذا كان البحث يفشل أرسل: اصلاح ذكي مشكلة الموسيقى"
-    if kind in ("العاب", "ألعاب", "games"):
-        asset_dir = BASE_DIR / "assets"
-        imgs = list(asset_dir.glob("game_*.jpg")) + list(asset_dir.glob("game_*.png")) if asset_dir.is_dir() else []
-        return f"🎮 فحص الألعاب\n• صور الألعاب المحلية: {len(imgs)}\n• الألعاب المضافة بالذكاء: {len(load_custom_games())}\n• Pillow: {'✅' if PIL_AVAILABLE else '❌'}"
-    if kind in ("صور", "صورة", "images"):
-        asset_dir = BASE_DIR / "assets"
-        imgs = [x for x in asset_dir.iterdir() if x.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")] if asset_dir.is_dir() else []
-        return f"🖼️ فحص الصور\n• ملفات الصور: {len(imgs)}\n• Pillow: {'✅' if PIL_AVAILABLE else '❌'}\n• رابط Railway العام: {'✅' if PUBLIC_BASE_URL else '⚠️ غير مضبوط'}"
-    if kind in ("سجل", "logs", "log"):
-        return "📋 آخر السجل:\n" + _safe_ai_text(_tail_log(80), 7000)
-    return "❌ الأمر غير معروف. اكتب: اصلاح"
-
-async def generate_ai_image(prompt, filename_prefix="ai"):
-    if not OPENAI_API_KEY:
-        return None, "⚠️ أضف OPENAI_API_KEY أولاً."
-    payload = {
-        "model": OPENAI_IMAGE_MODEL,
-        "prompt": str(prompt)[:4000],
-        "size": "1024x1024",
-        "quality": "medium",
-        "output_format": "png",
-    }
-    try:
-        async with http.post(
-            "https://api.openai.com/v1/images/generations",
-            json=payload,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=180),
-        ) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status >= 400:
-                return None, f"❌ فشل تصميم الصورة HTTP {resp.status}: {_safe_ai_text(body, 900)}"
-            item = (body.get("data") or [{}])[0]
-            b64 = item.get("b64_json")
-            if not b64:
-                return None, "❌ خدمة الصور لم تُرجع صورة قابلة للحفظ."
-            outdir = BASE_DIR / "generated_ai"
-            outdir.mkdir(exist_ok=True)
-            path = outdir / f"{filename_prefix}_{uuid.uuid4().hex}.png"
-            path.write_bytes(base64.b64decode(b64))
-            return path, None
-    except Exception as exc:
-        return None, f"❌ تعذر إنشاء الصورة: {type(exc).__name__}: {exc}"
-
-async def add_ai_game(uid, description):
-    if not description:
-        return "❌ الصيغة: اضف لعبة اسم_اللعبة | وصف اللعبة"
-    parts = [x.strip() for x in description.split("|", 1)]
-    name = parts[0][:40]
-    desc = parts[1][:800] if len(parts) > 1 else name
-    prompt = f"""أنشئ تعريف لعبة نصية بسيطة وآمنة لبوت دردشة. اسم اللعبة: {name}. الوصف: {desc}. أعد JSON فقط بالمفاتيح: command,title,win_chance,win_points,lose_points,win_message,lose_message,image_prompt. command كلمة عربية قصيرة بدون مسافات. win_chance رقم 1-100، النقاط أرقام صحيحة بين -1000 و1000. لا تضع HTML أو كود Python أو أوامر نظام."""
-    raw, err = await ai_response(prompt, 900)
-    if err: return err
-    try:
-        match = re.search(r"\{.*\}", raw, re.S)
-        data = json.loads(match.group(0) if match else raw)
-        command = re.sub(r"[^\w\u0600-\u06ff-]", "", str(data.get("command") or name.replace(" ", "")))[:24]
-        if not command: return "❌ لم يتم توليد أمر صالح للعبة."
-        data = {
-            "command": command, "title": str(data.get("title") or name)[:80],
-            "win_chance": max(1, min(100, int(data.get("win_chance", 50)))),
-            "win_points": max(-1000, min(1000, int(data.get("win_points", 20)))),
-            "lose_points": max(-1000, min(1000, int(data.get("lose_points", -5)))),
-            "win_message": str(data.get("win_message") or "🎉 فوز!")[:200],
-            "lose_message": str(data.get("lose_message") or "😅 خسارة!")[:200],
-            "image_prompt": str(data.get("image_prompt") or f"Game card for {name}, no text")[:1000],
-        }
-        path, err = await generate_ai_image(data["image_prompt"], "game")
-        if err: return err
-        url = await _store_media(path, "game", "image/png")
-        data["image_url"] = url
-        games = load_custom_games(); games[command] = data; save_custom_games(games)
-        try: path.unlink(missing_ok=True)
-        except Exception: pass
-        return f"✅ تمت إضافة اللعبة @{command}\n🎮 {data['title']}\n🖼️ تم تصميم صورتها وإضافتها تلقائياً.\nاكتب: {command}"
-    except Exception as exc:
-        return f"❌ تعذر اعتماد تعريف اللعبة من الذكاء الاصطناعي: {type(exc).__name__}: {exc}"
-
-async def handle_ai_dm(sender, text):
-    if (await username_of(sender)).lower() != OWNER:
-        return "🚫 نظام الصيانة والذكاء الاصطناعي متاح لصاحب البوت فقط."
-    low = normalize_text(text)
-    if low in ("اصلاح", "إصلاح", "ai", "ذكاء"):
-        return ("🛠️ مركز إصلاح البوت بالذكاء الاصطناعي\n"
-                "━━━━━━━━━━━━━━\n"
-                "1️⃣ اصلاح فحص — فحص Python وFFmpeg وYouTube والصور\n"
-                "2️⃣ اصلاح موسيقى — فحص مكونات الموسيقى\n"
-                "3️⃣ اصلاح العاب — فحص الألعاب والصور\n"
-                "4️⃣ اصلاح صور — فحص نظام الصور والرابط العام\n"
-                "5️⃣ اصلاح سجل — عرض آخر أخطاء السجل\n"
-                "6️⃣ اصلاح ذكي مشكلة — تحليل المشكلة بالذكاء الاصطناعي\n"
-                "7️⃣ صمم وصف — إنشاء صورة بالذكاء الاصطناعي وإضافتها للوسائط\n"
-                "8️⃣ اضف لعبة اسم | وصف — إنشاء لعبة + صورة + إضافتها للبوت\n"
-                "━━━━━━━━━━━━━━\n"
-                "🔐 كل هذه الأوامر خاصة بالمالك.")
-    if low.startswith("اصلاح ذكي ") or low.startswith("إصلاح ذكي "):
-        problem = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
-        result, err = await ai_diagnose(problem)
-        return err or "🤖 تشخيص الذكاء الاصطناعي:\n" + result
-    if low.startswith("اصلاح ") or low.startswith("إصلاح "):
-        kind = text.split(None, 1)[1]
-        return await run_repair_check(kind)
-    if low.startswith("صمم ") or low.startswith("صمم صورة "):
-        prompt = text.split(None, 1)[1]
-        if normalize_text(prompt).startswith("صورة "): prompt = prompt.split(None, 1)[1]
-        path, err = await generate_ai_image(prompt, "design")
-        if err: return err
-        try:
-            url = await _store_media(path, "publish", "image/png")
-            await dm_send_media(sender, "🖼️ تم تصميم الصورة بالذكاء الاصطناعي.", url, "image")
-            return "✅ أرسلت لك الصورة في الخاص."
-        finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
-    if low.startswith("اضف لعبة ") or low.startswith("أضف لعبة "):
-        description = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
-        return await add_ai_game(sender, description)
-    return None
-
 async def dm_loop():
     while True:
         try:
@@ -2994,7 +2633,6 @@ async def dm_loop():
                 if sender and sender != BOT_ID and text:
                     parts = text.split(maxsplit=1)
                     cmd, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
-                    low = normalize_text(text)
                     is_owner = (await username_of(sender)).lower() == OWNER
                     reply = ""
                     if cmd in ("دخول", "join") and is_owner:
@@ -3003,19 +2641,6 @@ async def dm_loop():
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
-                    elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_owner:
-                        ok, m = await telegram_backup(); reply = m
-                    elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر") and is_owner:
-                        reply = ("👑 أوامر الماستر\n"
-                                 "اصلاح — مركز الصيانة والذكاء الاصطناعي\n"
-                                 "اصلاح ذكي مشكلة — تشخيص مشكلة\n"
-                                 "صمم وصف — تصميم صورة AI\n"
-                                 "اضف لعبة اسم | وصف — إنشاء لعبة وصورتها\n"
-                                 "نسخ احتياطي — رفع نسخة آمنة إلى Telegram\n"
-                                 "غرفي — عرض الغرف المتصلة\n"
-                                 "دخول اسم / خروج اسم — إدارة الغرف")
-                    elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة "))):
-                        reply = await handle_ai_dm(sender, text)
                     if reply: await dm_send(sender, reply)
                 await run(lambda i=row["id"]: sb.table("dm_relay").delete().eq("id", i).execute())
         except Exception:
@@ -3056,8 +2681,7 @@ async def heartbeat_loop():
                 except Exception:
                     log.exception("failed to announce war timeout for room %s", rid)
         # تنظيف طلبات نشر@ القديمة
-        for key, pending in list(publish_pending.items()):
-            created = pending.get("created_at", 0) if isinstance(pending, dict) else pending
+        for key, created in list(publish_pending.items()):
             if now - created > 120:
                 publish_pending.pop(key, None)
         await asyncio.sleep(10)
@@ -3127,6 +2751,8 @@ async def main():
         # إذا كانت الغرف محفوظة من قبل، أعد الانضمام إليها حتى لو خرج البوت بسبب انقطاع الشبكة.
         if not rooms:
             await restore_saved_rooms()
+        log.info("الذكاء الاصطناعي المحلي: %s", local_ai_status())
+        log.info("لا يحتاج البوت إلى OPENAI_API_KEY.")
         log.info("البوت جاهز كـ @%s", USERNAME)
         music_task = asyncio.create_task(music_worker_queue(), name="music-queue")
         try:
