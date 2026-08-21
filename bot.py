@@ -841,10 +841,112 @@ async def dm_send_media(uid, text, media_url, m_type="image"):
 def _code4():
     return ''.join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
 
+async def register_social_codes(post_id, owner_id, owner_name, kind, title="", room_id=None):
+    # كود واحد عشوائي من 4 خانات لكل منشور/أغنية، وتستخدمه جميع التفاعلات.
+    code = _code4()
+    codes = {
+        "like": code, "love": code, "dislike": code,
+        "comment": code, "report": code,
+    }
+    posts = load_published_posts()
+    item = posts.get(str(post_id), {})
+    item.update({
+        "post_id": str(post_id), "owner_id": str(owner_id), "owner_name": owner_name,
+        "type": kind, "title": title, "source_room_id": str(room_id) if room_id else item.get("source_room_id"),
+        "reaction_codes": codes,
+    })
+    posts[str(post_id)] = item
+    save_published_posts(posts)
+    return codes
+
+async def handle_social_reaction(rid, text, uid, p_name):
+    # Supported formats, matching the UI shown in the supplied screenshots:
+    # lk@AB12 / lv@AB12 / dl@AB12 / cm@AB12 text / report@AB12 text
+    raw = str(text or "").strip()
+    m = re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", raw, re.I | re.S)
+    if not m:
+        return None
+    action, code, extra = m.group(1).lower(), m.group(2).upper(), (m.group(3) or "").strip()
+    posts = load_published_posts()
+    found = None
+    post = None
+    for pid, item in posts.items():
+        codes = item.get("reaction_codes") or {}
+        for key, value in codes.items():
+            if str(value).upper() == code:
+                found = key; post = item; post_id = pid; break
+        if found: break
+    if not post:
+        return "❌ كود التفاعل غير صالح أو انتهت صلاحيته."
+
+    owner_id = str(post.get("owner_id") or "")
+    if not owner_id:
+        return "❌ تعذر تحديد صاحب المنشور."
+    if owner_id == str(uid):
+        return "⚠️ لا يمكنك تسجيل تفاعل على منشورك بنفس حسابك."
+
+    labels = {"like":"👍 إعجاب", "love":"❤️ أحببتة", "dislike":"👎 عدم إعجاب", "comment":"💬 تعليق", "report":"🚨 إبلاغ"}
+    if action in ("cm", "report") and not extra:
+        return f"❌ اكتب: {action}@{code} النص"
+    action_key = {"lk":"like", "lv":"love", "dl":"dislike", "cm":"comment", "report":"report"}[action]
+    event = {
+        "id": str(uuid.uuid4()), "post_id": str(post_id), "type": action_key,
+        "actor_id": str(uid), "actor_name": p_name, "owner_id": owner_id,
+        "text": extra, "room_id": str(rid), "created_at": now_iso(),
+    }
+    events = load_social_events()
+    events[event["id"]] = event
+    save_social_events(events)
+
+    title = post.get("title") or ("منشور صورة" if post.get("type") == "image" else "أغنية")
+    room_name = rooms.get(rid, "الغرفة")
+    if action_key == "comment":
+        notification = (f"💬 تعليق جديد على منشورك\n🎵/🖼️ {title}\n"
+                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 {extra}")
+    elif action_key == "report":
+        notification = (f"🚨 بلاغ على منشورك\n🎵/🖼️ {title}\n"
+                        f"👤 من: @{p_name}\n🏠 الغرفة: {room_name}\n📝 السبب: {extra}")
+    else:
+        notification = (f"{labels[action_key]} على منشورك\n"
+                        f"🎵/🖼️ {title}\n👤 من: @{p_name}\n🏠 الغرفة: {room_name}")
+    try:
+        await dm_send(owner_id, notification)
+    except Exception:
+        log.exception("social private notification failed")
+    return f"✅ تم تسجيل {labels[action_key]} وإرسال الإشعار إلى خاص الناشر."
+
+async def telegram_find_chat_id():
+    """Find the latest private Telegram chat that interacted with this bot.
+    TELEGRAM_BACKUP_CHAT_ID is optional; the user only needs to send /start to the bot once.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return None, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
+    if TELEGRAM_BACKUP_CHAT_ID:
+        return TELEGRAM_BACKUP_CHAT_ID, None
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        async with http.get(url, params={"limit": 100, "allowed_updates": json.dumps(["message"])},
+                            timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            body = await resp.json(content_type=None)
+            if resp.status >= 400 or not body.get("ok"):
+                return None, f"❌ تعذر الوصول إلى Telegram API: HTTP {resp.status}"
+            updates = body.get("result") or []
+            for update in reversed(updates):
+                msg = update.get("message") or {}
+                chat = msg.get("chat") or {}
+                if chat.get("type") == "private" and chat.get("id") is not None:
+                    return str(chat["id"]), None
+            return None, "⚠️ لم أجد محادثة خاصة مع البوت. أرسل /start إلى بوت Telegram أولاً ثم أعد أمر نسخ احتياطي."
+    except Exception as exc:
+        return None, f"❌ تعذر تحديد محادثة Telegram: {type(exc).__name__}: {exc}"
+
 async def telegram_backup():
-    """Create a safe backup of bot data/config (excluding secrets and cookies) and upload it to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_BACKUP_CHAT_ID:
-        return False, "⚠️ أضف TELEGRAM_BOT_TOKEN و TELEGRAM_BACKUP_CHAT_ID في Railway Variables."
+    """Create a safe backup and send it using TELEGRAM_BOT_TOKEN only."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "⚠️ أضف TELEGRAM_BOT_TOKEN في Railway Variables."
+    chat_id, chat_error = await telegram_find_chat_id()
+    if not chat_id:
+        return False, chat_error
     tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
     archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
     try:
@@ -863,7 +965,7 @@ async def telegram_backup():
             if logp.is_file(): z.write(logp, arcname="logs/bot.log")
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         form = aiohttp.FormData()
-        form.add_field("chat_id", TELEGRAM_BACKUP_CHAT_ID)
+        form.add_field("chat_id", chat_id)
         form.add_field("caption", "📦 نسخة احتياطية آمنة للبوت\n🔐 تم استبعاد مفاتيح API وكوكيز YouTube.")
         form.add_field("document", archive.open("rb"), filename=archive.name, content_type="application/zip")
         async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
@@ -1754,15 +1856,23 @@ async def play_track(rid, track, source_label, requester_id, requester_name):
         "media_url": media_url, "audio_url": media_url, "created_at": now_iso()
     }
     save_published_posts(posts)
+    codes = await register_social_codes(post_id, requester_id, requester_name, "music", title, rid)
 
-    # المطلوب: تفاصيل الأغنية كنص أولاً، ثم رسالة الصوت وحدها. لا صورة للأغنية.
+    # نفس شكل بطاقة SONG BROADCAST في الصورة المرسلة، مع كود واحد متغير لكل أغنية.
     caption = (
-        f"🎵 جاري تشغيل الأغنية\n"
-        f"🎶 {title} — {artist}\n"
-        f"👤 الطلب بواسطة: @{requester_name}\n"
-        f"🏠 الغرفة: {source_room}\n"
-        f"🆔 {post_id}\n"
-        f"❤️ إعجاب   👎 عدم إعجاب   💖 أحببته   💬 تعليق"
+        "🎵 SONG BROADCAST\n"
+        ".sa Music name\n"
+        f"🎤 {requester_name}\n"
+        f"{title}\n\n"
+        f"⏱️ Source: {source_label}\n"
+        f"🆔 {codes['like']}\n"
+        f"💬 Room: {source_room}\n"
+        "━━━━━━━━━━━━━\n"
+        f"👍 lk@{codes['like']}\n"
+        f"❤️ lv@{codes['like']}\n"
+        f"👎 dl@{codes['like']}\n"
+        f"💬 cm@{codes['like']} msg\n"
+        f"🚨 report@{codes['like']} msg"
     )
     targets = await all_room_ids()
     for target_rid in targets:
@@ -2043,6 +2153,10 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
     p_name = await username_of(uid)
     lower_text = text.strip().lower()
 
+    social_reply = await handle_social_reaction(rid, text, uid, p_name)
+    if social_reply is not None:
+        return social_reply
+
     admin_prefixes = ("+mf@", "-mf@", "clear@mf", "l@mf", "mf@on", "mf@off",
                       "+wc ", "clear@wc", "l@wc", "wc@on", "wc@off", "mas@")
     if not lower_text.startswith(admin_prefixes):
@@ -2131,24 +2245,23 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             public_media_url = await cache_publish_media(media_url) or media_url
             post_id = str(uuid.uuid4())
             posts = load_published_posts()
-            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "created_at": now_iso()}
+            posts[post_id] = {"post_id": post_id, "owner_id": str(uid), "owner_name": p_name, "source_room_id": str(rid), "media_url": public_media_url, "type": "image", "title": description or "منشور صورة", "created_at": now_iso()}
             save_published_posts(posts)
+            codes = await register_social_codes(post_id, uid, p_name, "image", description or "منشور صورة", rid)
             published = 0
             for target_rid in await all_room_ids():
                 try:
-                    target_name = rooms.get(target_rid, "الغرفة")
-                    like_code, love_code, dislike_code, comment_code, report_code = [_code4() for _ in range(5)]
                     caption = (
                         "✨════════════✨\n"
                         "🖼️ منشور الصورة من:\n"
                         f"@{p_name}\n"
                         "📝 الوصف: " + (description or "بدون وصف") + "\n"
                         "━━━━━━━━━━━━━\n"
-                        f"👍 إعجاب: {like_code}@Like\n"
-                        f"❤ أحببتة: {love_code}@loved\n"
-                        f"👎 عدم إعجاب: {dislike_code}@Dislike\n"
-                        f"✉️تعليق{comment_code}@msg@[{post_id}]\n"
-                        f"🚨 إبلاغ: {report_code}@report@[{post_id}]\n"
+                        f"👍 {codes['like']}@Like\n"
+                        f"❤️ {codes['love']}@loved\n"
+                        f"👎 {codes['dislike']}@Dislike\n"
+                        f"💬 {codes['comment']}@msg\n"
+                        f"🚨 {codes['report']}@report\n"
                         "✨════════════✨"
                     )
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
@@ -2386,7 +2499,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             }
             await room_send_media(
                 rid,
-                f"⚔️ @{p_name} بدأ لعبة الحرب!\n⏳ جاري الانتظار: اكتب «حرب» للانضمام.\n🎯 لكل لاعب 3 محاولات من 1 إلى 6.\n⌛ تنتهي اللعبة تلقائياً إذا لم ينضم خصم.",
+                f"🚢 بدأت لعبة حرب السفن | Battleship Started\n👤 اللاعب: @{p_name}\n♟️ السفينة مخفية | ينتظر الخصم\n🎯 اختر رقماً من 1 إلى 6 بعد الانضمام\n⌛ اكتب حرب للانضمام.",
                 GAME_IMAGES["war"],
             )
             return None
@@ -2403,7 +2516,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["expires_at"] = now + 120
             await room_send_media(
                 rid,
-                f"⚔️ بدأت الحرب!\n👤 @{game['p1_name']} ضد @{p_name}\n🎯 دور @{game['p1_name']} — اكتب رقماً من 1 إلى 6.\n🔥 لكل لاعب 3 محاولات.\n⌛ المهلة دقيقتان لكل حركة.",
+                f"🚢 بدأت لعبة حرب السفن | Battleship Started\n👤 @{game['p1_name']} × @{p_name}\n♟️ السفينة مخفية\n\n🎯 لوحة الخصم | Opponent's Board\n1 | 2 | 3 | 4 | 5 | 6\n━━━━━━━━━━━━━━\nAttempts | المحاولات المتبقية: 3\nChoose a number (1-6) | اختر رقماً من 1 إلى 6",
                 GAME_IMAGES["war"],
             )
             return None
@@ -2462,7 +2575,7 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             game["expires_at"] = now + 120
             await room_send(
                 rid,
-                f"❌ الرقم {n} ليس السفينة.\n🔄 دور @{next_name} — بقيت له {remaining} محاولات."
+                f"❌ الرقم {n} ليس السفينة.\n🎯 لوحة الخصم | Opponent's Board\n1 | 2 | 3 | 4 | 5 | 6\n━━━━━━━━━━━━━━\nAttempts | المحاولات المتبقية: {remaining}\n🔄 دور @{next_name}\nChoose a number (1-6) | اختر رقماً من 1 إلى 6"
             )
             return None
 
