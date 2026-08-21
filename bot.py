@@ -20,6 +20,7 @@ import tempfile
 import shutil
 import base64
 import subprocess
+import zipfile
 from pathlib import Path
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -101,6 +102,8 @@ OWNER = (C.get("owner_username") or USERNAME).strip().lower()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip()
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BACKUP_CHAT_ID = os.environ.get("TELEGRAM_BACKUP_CHAT_ID", "").strip()
 AI_MAX_LOG_LINES = max(20, int(os.environ.get("AI_MAX_LOG_LINES", "120")))
 POLL = max(1.0, float(C.get("poll_seconds", 2)))
 SEARCH_URL = C.get("music_search_url") or "https://giant-chat-app.lovable.app/api/public/search-track"
@@ -312,7 +315,7 @@ music_queue = asyncio.Queue()      # room_id, query, source, requester_id, reque
 music_state = {}     # room_id -> آخر أغنية شغّلها البوت
 music_last_by_user = {}  # user_id -> آخر طلب أغنية، فاصل مستقل دقيقتان لكل مستخدم
 music_tasks = {}      # room_id -> مهمة البحث/التشغيل الخلفية
-publish_pending = {}  # (room_id, user_id) -> وقت طلب نشر@
+publish_pending = {}  # (room_id, user_id) -> {created_at, description}
 SOCIAL_SEEN = set()
 SOCIAL_WEBHOOK_TOKEN = str(os.environ.get("SOCIAL_WEBHOOK_TOKEN") or C.get("social_webhook_token", "")).strip()
 http: aiohttp.ClientSession = None
@@ -833,6 +836,74 @@ async def dm_send_media(uid, text, media_url, m_type="image"):
     await run(lambda: sb.table("dm_relay").insert({
         "sender_id": BOT_ID, "recipient_id": uid, "envelope": envelope
     }).execute())
+
+
+def _code4():
+    return ''.join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+
+async def telegram_backup():
+    """Create a safe backup of bot data/config (excluding secrets and cookies) and upload it to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_BACKUP_CHAT_ID:
+        return False, "⚠️ أضف TELEGRAM_BOT_TOKEN و TELEGRAM_BACKUP_CHAT_ID في Railway Variables."
+    tmp = Path(tempfile.mkdtemp(prefix="bot_backup_"))
+    archive = tmp / f"bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
+    try:
+        include = ["rooms.json", "masters.json", "bans.json", "moderation.json", "welcome.json",
+                   "replies.json", "points.json", "vip_users.json", "custom_games.json", "published_posts.json", "social_events.json"]
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+            # config بدون كلمات مرور/مفاتيح. الأسرار لا تدخل النسخة الاحتياطية.
+            safe_config = dict(C)
+            for secret_key in ("password", "supabase_key", "youtube_cookies", "api_key", "openai_api_key"):
+                safe_config.pop(secret_key, None)
+            z.writestr("config.safe.json", json.dumps(safe_config, ensure_ascii=False, indent=2))
+            for name in include:
+                path = BASE_DIR / name
+                if path.is_file(): z.write(path, arcname=name)
+            logp = BASE_DIR / "logs" / "bot.log"
+            if logp.is_file(): z.write(logp, arcname="logs/bot.log")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", TELEGRAM_BACKUP_CHAT_ID)
+        form.add_field("caption", "📦 نسخة احتياطية آمنة للبوت\n🔐 تم استبعاد مفاتيح API وكوكيز YouTube.")
+        form.add_field("document", archive.open("rb"), filename=archive.name, content_type="application/zip")
+        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                return False, f"❌ فشل رفع النسخة إلى Telegram: HTTP {resp.status} {body[:300]}"
+        return True, "✅ تم إنشاء ورفع النسخة الاحتياطية إلى Telegram."
+    except Exception as exc:
+        log.exception("telegram backup failed")
+        return False, f"❌ تعذر إنشاء النسخة الاحتياطية: {type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+async def share_music_to_user(sender_uid, target_name, current):
+    target = str(target_name or "").strip().lstrip("@")
+    if not target or not current:
+        return "❌ الصيغة: مشاركة@اسم_الشخص"
+    rows, _ = await table_select(lambda: sb.table("profiles").select("id,username").ilike("username", target).limit(1).execute())
+    if not rows:
+        return f"❌ الحساب @{target} غير موجود."
+    receiver = rows[0]
+    title = current.get("title", "المقطع")
+    artist = current.get("artist", "")
+    media = current.get("audio_url") or current.get("youtube_url") or current.get("tiktok_url")
+    if not media:
+        return "❌ لا يوجد ملف صوتي أو رابط صالح للمشاركة."
+    await dm_send(receiver["id"], f"🎵 تمت مشاركة أغنية معك من @{await username_of(sender_uid)}\n🎶 {title} — {artist}")
+    await dm_send_media(receiver["id"], f"▶️ {title}", media, "voice")
+    return f"✅ تمت مشاركة «{title}» مع @{receiver.get('username') or target} في الخاص."
+
+async def user_presence(uid, username):
+    rows, _ = await table_select(lambda: sb.table("room_members").select("room_id").eq("user_id", uid).execute())
+    room_ids = [r.get("room_id") for r in rows or [] if r.get("room_id")]
+    names = []
+    if room_ids:
+        rooms_rows, _ = await table_select(lambda: sb.table("rooms").select("id,name").in_("id", room_ids).execute())
+        names = [r.get("name") or str(r.get("id")) for r in rooms_rows or []]
+    if names:
+        return f"🟢 @{username} متصل حالياً\n🏠 الغرف: " + ", ".join(names)
+    return f"⚪ @{username} غير ظاهر حالياً في أي غرفة متصلة بالبوت."
 
 async def _master_user_ids():
     """Resolve saved master usernames/IDs to profile IDs for private diagnostics."""
@@ -1999,13 +2070,16 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
 
     # نشر@: الماستر يطلب صورة في رسالة لاحقة، ثم ينشرها في كل الغرف.
     publish_key = (rid, uid)
-    if text.strip() in ("نشر@", "publish@"):
+    if text.strip() == "نشر@" or text.strip().startswith("نشر@") or text.strip() == "publish@" or text.strip().startswith("publish@"):
         if not await is_master(uid, p_name):
             return "🚫 للماستر فقط."
         vip_error = await require_vip(uid, p_name, "نظام النشر")
         if vip_error: return vip_error
-        publish_pending[publish_key] = time.time()
-        return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع اسم الغرفة وخيارات: ❤️ إعجاب | 👎 مااعجاب | ↩️ رد."
+        description = ""
+        if "@" in text:
+            description = text.split("@", 1)[1].strip()
+        publish_pending[publish_key] = {"created_at": time.time(), "description": description}
+        return "🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في كل الغرف مع الوصف الذي كتبته."
 
     async def cache_publish_media(source_url):
         """Copy an incoming image to this bot's public storage so it remains
@@ -2044,8 +2118,10 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    pending_at = publish_pending.get(publish_key)
-    if pending_at is not None:
+    pending = publish_pending.get(publish_key)
+    if pending is not None:
+        pending_at = pending.get("created_at", 0) if isinstance(pending, dict) else pending
+        description = pending.get("description", "") if isinstance(pending, dict) else ""
         if time.time() - pending_at > 120:
             publish_pending.pop(publish_key, None)
         elif message_type in ("image", "photo", "sticker") and media_url:
@@ -2061,12 +2137,19 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
             for target_rid in await all_room_ids():
                 try:
                     target_name = rooms.get(target_rid, "الغرفة")
+                    like_code, love_code, dislike_code, comment_code, report_code = [_code4() for _ in range(5)]
                     caption = (
-                        f"📢 نشر@ من غرفة: {source_room}\n"
-                        f"👤 بواسطة: @{p_name}\n"
-                        f"🆔 {post_id}\n"
-                        f"🏠 {target_name}\n"
-                        f"❤️ إعجاب   👎 عدم إعجاب   ↩️ رد"
+                        "✨════════════✨\n"
+                        "🖼️ منشور الصورة من:\n"
+                        f"@{p_name}\n"
+                        "📝 الوصف: " + (description or "بدون وصف") + "\n"
+                        "━━━━━━━━━━━━━\n"
+                        f"👍 إعجاب: {like_code}@Like\n"
+                        f"❤ أحببتة: {love_code}@loved\n"
+                        f"👎 عدم إعجاب: {dislike_code}@Dislike\n"
+                        f"✉️تعليق{comment_code}@msg@[{post_id}]\n"
+                        f"🚨 إبلاغ: {report_code}@report@[{post_id}]\n"
+                        "✨════════════✨"
                     )
                     await room_send_media(target_rid, caption, public_media_url, m_type="image")
                     await room_send(target_rid, "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة")
@@ -2223,6 +2306,22 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         vip_error = await require_vip(uid, p_name, "أوامر الألعاب")
         if vip_error:
             return vip_error
+
+    if cmd == ".sa":
+        cmd = "تشغيل"
+
+    if text.strip().lower().startswith("is@"):
+        target = text.split("@", 1)[1].strip().lstrip("@")
+        rows, _ = await table_select(lambda: sb.table("profiles").select("id,username").ilike("username", target).limit(1).execute())
+        if not rows:
+            return f"❌ الحساب @{target} غير موجود."
+        return await user_presence(rows[0]["id"], rows[0].get("username") or target)
+
+    if text.strip().lower().startswith("مشاركة@"):
+        vip_error = await require_vip(uid, p_name, "مشاركة الأغاني")
+        if vip_error: return vip_error
+        target = text.split("@", 1)[1].strip()
+        return await share_music_to_user(uid, target, music_state.get(rid))
 
     if cmd in ("تشغيل", "play", "شغل"):
         vip_error = await require_vip(uid, p_name, "تشغيل الأغاني")
@@ -2791,6 +2890,17 @@ async def dm_loop():
                         ok, m = await leave(arg); reply = ("✅ " if ok else "❌ ") + m
                     elif cmd in ("غرفي", "rooms"):
                         reply = "🏠 " + (", ".join(rooms.values()) if rooms else "لا توجد غرف")
+                    elif low in ("نسخ احتياطي", "backup", "backup@telegram") and is_owner:
+                        ok, m = await telegram_backup(); reply = m
+                    elif low in ("master", "ماستر", "اوامر الماستر", "أوامر الماستر") and is_owner:
+                        reply = ("👑 أوامر الماستر\n"
+                                 "اصلاح — مركز الصيانة والذكاء الاصطناعي\n"
+                                 "اصلاح ذكي مشكلة — تشخيص مشكلة\n"
+                                 "صمم وصف — تصميم صورة AI\n"
+                                 "اضف لعبة اسم | وصف — إنشاء لعبة وصورتها\n"
+                                 "نسخ احتياطي — رفع نسخة آمنة إلى Telegram\n"
+                                 "غرفي — عرض الغرف المتصلة\n"
+                                 "دخول اسم / خروج اسم — إدارة الغرف")
                     elif text and (cmd in ("اصلاح", "إصلاح", "ذكاء", "ai", "صمم", "اضف", "أضف") or low.startswith(("اصلاح ", "إصلاح ", "صمم ", "اضف لعبة ", "أضف لعبة "))):
                         reply = await handle_ai_dm(sender, text)
                     if reply: await dm_send(sender, reply)
@@ -2833,7 +2943,8 @@ async def heartbeat_loop():
                 except Exception:
                     log.exception("failed to announce war timeout for room %s", rid)
         # تنظيف طلبات نشر@ القديمة
-        for key, created in list(publish_pending.items()):
+        for key, pending in list(publish_pending.items()):
+            created = pending.get("created_at", 0) if isinstance(pending, dict) else pending
             if now - created > 120:
                 publish_pending.pop(key, None)
         await asyncio.sleep(10)
